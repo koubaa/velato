@@ -3,7 +3,10 @@
 
 use crate::{ExampleScene, SceneConfig, SceneParams, SceneSet};
 use kurbo::Affine;
+#[cfg(feature = "use_vello")]
 use vello::*;
+#[cfg(feature = "use_ekrano")]
+use ekrano::*;
 
 macro_rules! scene {
     ($name: ident) => {

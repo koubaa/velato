@@ -19,12 +19,20 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = ["use_vello"]
+use_vello = ["dep:vello", "dep:wgpu", "scenes/use_vello"]
+use_ekrano = ["dep:ekrano", "dep:goldy", "dep:softbuffer", "scenes/use_ekrano"]
+
 [dependencies]
-vello = { workspace = true, features = ["wgpu"] }
+vello = { workspace = true, features = ["wgpu"], optional = true }
+ekrano = { workspace = true, optional = true }
+goldy = { workspace = true, optional = true }
+softbuffer = { version = "0.4", optional = true }
 kurbo = { workspace = true }
 peniko = { workspace = true }
-wgpu = { version = "26.0", features = ["vulkan", "metal", "dx12"] }
-scenes = { path = "../scenes" }
+wgpu = { version = "27.0", features = ["vulkan", "metal", "dx12"], optional = true }
+scenes = { path = "../scenes", default-features = false }
 anyhow = "1"
 clap = { version = "4.5.38", features = ["derive"] }
 instant = { version = "0.1.13", features = ["wasm-bindgen"] }
@@ -34,7 +42,7 @@ env_logger = "0.11.8"
 log = "0.4.27"
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
-vello = { workspace = true, features = ["hot_reload", "wgpu"] }
+vello = { workspace = true, features = ["hot_reload", "wgpu"], optional = true }
 notify-debouncer-mini = "0.3"
 
 [target.'cfg(target_os = "android")'.dependencies]

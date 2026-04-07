@@ -87,6 +87,8 @@ clippy.wildcard_dependencies = "warn"
 [workspace.dependencies]
 # NOTE: Make sure to keep this in sync with the version badge in README.md
 vello = { version = "0.7.0", default-features = false }
+ekrano = { path = "../../ekrano/ekrano" }
+goldy = { path = "../../goldy" }
 kurbo = { version = "0.13.0" }
 peniko = { version = "0.6.0" }
 
@@ -95,6 +97,7 @@ workspace = true
 
 [dependencies]
 vello = { workspace = true, optional = true }
+ekrano = { workspace = true, optional = true }
 kurbo = { workspace = true }
 peniko = { workspace = true }
 
@@ -113,3 +116,4 @@ wasm-bindgen-test = "0.3.58"
 default = ["vello"]
 vello = ["dep:vello"]
 wgpu = ["vello", "vello/wgpu"]
+ekrano = ["dep:ekrano"]

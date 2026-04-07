@@ -39,7 +39,11 @@ pub use test_scenes::test_scenes;
 
 use kurbo::Vec2;
 use peniko::{Color, color};
+
+#[cfg(feature = "use_vello")]
 use vello::Scene;
+#[cfg(feature = "use_ekrano")]
+use ekrano::Scene;
 
 pub struct SceneParams<'a> {
     pub time: f64,

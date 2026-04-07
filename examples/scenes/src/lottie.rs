@@ -15,7 +15,10 @@ use std::{
     path::{Path, PathBuf},
 };
 use velato::Composition;
+#[cfg(feature = "use_vello")]
 use vello::Scene;
+#[cfg(feature = "use_ekrano")]
+use ekrano::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn scene_from_files(files: &[PathBuf]) -> Result<SceneSet> {
@@ -106,7 +109,14 @@ pub fn lottie_function_of<R: AsRef<str>>(
         let frame = ((start.elapsed().as_secs_f64() * lottie.frame_rate)
             % (lottie.frames.end - lottie.frames.start))
             + lottie.frames.start;
-        renderer.render_to_vello_scene(lottie, frame, Affine::IDENTITY, 1.0)
+        #[cfg(feature = "use_vello")]
+        {
+            renderer.render_to_vello_scene(lottie, frame, Affine::IDENTITY, 1.0)
+        }
+        #[cfg(feature = "use_ekrano")]
+        {
+            renderer.render_to_ekrano_scene(lottie, frame, Affine::IDENTITY, 1.0)
+        }
     }
     let started = Instant::now();
     let mut renderer = velato::Renderer::new();

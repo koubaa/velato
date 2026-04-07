@@ -19,7 +19,6 @@
 
 use instant::Instant;
 use std::collections::HashSet;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -27,14 +26,26 @@ use clap::{CommandFactory, Parser};
 use kurbo::{Affine, Vec2};
 use peniko::Color;
 use scenes::{RobotoText, SceneParams, SceneSet};
+
+#[cfg(feature = "use_vello")]
+use std::num::NonZeroUsize;
+#[cfg(feature = "use_vello")]
 use vello::low_level::BumpAllocators;
+#[cfg(feature = "use_vello")]
 use vello::util::{RenderContext, RenderSurface};
+#[cfg(feature = "use_vello")]
 use vello::{AaConfig, Renderer, RendererOptions, Scene, wgpu};
+
+#[cfg(feature = "use_ekrano")]
+use ekrano::Scene;
 
 use winit::event_loop::{EventLoop, EventLoopBuilder};
 use winit::window::Window;
 
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+#[cfg(all(
+    feature = "use_vello",
+    not(any(target_arch = "wasm32", target_os = "android"))
+))]
 mod hot_reload;
 mod multi_touch;
 mod stats;
@@ -67,6 +78,7 @@ fn default_threads() -> usize {
     return 0;
 }
 
+#[cfg(feature = "use_vello")]
 struct RenderState<'s> {
     // SAFETY: We MUST drop the surface before the `window`, so the fields
     // must be in this order
@@ -74,6 +86,7 @@ struct RenderState<'s> {
     window: Arc<Window>,
 }
 
+#[cfg(feature = "use_vello")]
 fn run(
     event_loop: EventLoop<UserEvent>,
     args: Args,
@@ -552,6 +565,7 @@ fn run(
         .expect("run to completion");
 }
 
+#[cfg(feature = "use_vello")]
 fn create_window(event_loop: &winit::event_loop::EventLoopWindowTarget<UserEvent>) -> Arc<Window> {
     use winit::dpi::LogicalSize;
     use winit::window::WindowBuilder;
@@ -565,38 +579,17 @@ fn create_window(event_loop: &winit::event_loop::EventLoopWindowTarget<UserEvent
     )
 }
 
+#[cfg(feature = "use_vello")]
 #[derive(Debug)]
 enum UserEvent {
     #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     HotReload,
 }
 
-#[cfg(target_arch = "wasm32")]
-fn display_error_message() -> Option<()> {
-    let window = web_sys::window()?;
-    let document = window.document()?;
-    let elements = document.get_elements_by_tag_name("body");
-    let body = elements.item(0)?;
-    body.set_inner_html(
-        r#"<style>
-        p {
-            margin: 2em 10em;
-            font-family: sans-serif;
-        }
-        </style>
-        <p><a href="https://caniuse.com/webgpu">WebGPU</a>
-        is not enabled. Make sure your browser is updated to
-        <a href="https://chromiumdash.appspot.com/schedule">Chrome M113</a> or
-        another browser compatible with WebGPU.</p>"#,
-    );
-    Some(())
-}
-
 /// # Panics
 /// Can panic.
+#[cfg(feature = "use_vello")]
 pub fn main() -> Result<()> {
-    // TODO: initializing both env_logger and console_logger fails on wasm.
-    // Figure out a more principled approach.
     #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
     let args = Args::parse();
@@ -616,79 +609,310 @@ pub fn main() -> Result<()> {
 
             run(event_loop, args, scenes, render_cx);
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-            console_log::init().expect("could not initialize logger");
-            use winit::platform::web::WindowExtWebSys;
-            let window = create_window(&event_loop);
-            // On wasm, append the canvas to the document body
-            let canvas = window.canvas().unwrap();
-            web_sys::window()
-                .and_then(|win| win.document())
-                .and_then(|doc| doc.body())
-                .and_then(|body| body.append_child(canvas.as_ref()).ok())
-                .expect("couldn't append canvas to document body");
-            // Best effort to start with the canvas focused, taking input
-            drop(web_sys::HtmlElement::from(canvas).focus());
-            wasm_bindgen_futures::spawn_local(async move {
-                let (width, height, scale_factor) = web_sys::window()
-                    .map(|w| {
-                        (
-                            w.inner_width().unwrap().as_f64().unwrap(),
-                            w.inner_height().unwrap().as_f64().unwrap(),
-                            w.device_pixel_ratio(),
-                        )
-                    })
-                    .unwrap();
-                let size =
-                    winit::dpi::PhysicalSize::from_logical::<_, f64>((width, height), scale_factor);
-                _ = window.request_inner_size(size);
-                let surface = render_cx
-                    .create_surface(
-                        window.clone(),
-                        size.width,
-                        size.height,
-                        wgpu::PresentMode::AutoVsync,
-                    )
-                    .await;
-                if let Ok(surface) = surface {
-                    let render_state = RenderState { window, surface };
-                    // No error handling here; if the event loop has finished,
-                    // we don't need to send them the surface
-                    run(event_loop, args, scenes, render_cx, render_state);
-                } else {
-                    _ = display_error_message();
-                }
-            });
-        }
     }
     Ok(())
 }
 
-#[cfg(target_os = "android")]
-use winit::platform::android::activity::AndroidApp;
+// ---------------------------------------------------------------------------
+// Ekrano backend
+// ---------------------------------------------------------------------------
+#[cfg(feature = "use_ekrano")]
+fn create_ekrano_window(
+    event_loop: &winit::event_loop::EventLoopWindowTarget<()>,
+) -> Arc<Window> {
+    use winit::dpi::LogicalSize;
+    use winit::window::WindowBuilder;
+    Arc::new(
+        WindowBuilder::new()
+            .with_inner_size(LogicalSize::new(1044, 800))
+            .with_resizable(true)
+            .with_title("Ekrano demo")
+            .build(event_loop)
+            .unwrap(),
+    )
+}
 
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-fn android_main(app: AndroidApp) {
-    use winit::platform::android::EventLoopBuilderExtAndroid;
+#[cfg(feature = "use_ekrano")]
+fn run_ekrano(
+    event_loop: EventLoop<()>,
+    args: Args,
+    mut scenes: SceneSet,
+) {
+    use winit::event::*;
+    use winit::event_loop::ControlFlow;
+    use winit::keyboard::*;
+    use goldy::{DeviceType, Instance};
+    use ekrano::{GoldyRenderer, RenderParams};
 
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Warn),
-    );
+    let instance = Instance::new().expect("Failed to create Goldy instance");
+    let device = instance
+        .create_device(DeviceType::DiscreteGpu)
+        .or_else(|_| instance.create_device(DeviceType::IntegratedGpu))
+        .or_else(|_| instance.create_device(DeviceType::Other))
+        .expect("No GPU device found");
 
-    let event_loop = EventLoopBuilder::with_user_event()
-        .with_android_app(app)
-        .build()
-        .expect("Required to continue");
+    let start_create = Instant::now();
+    let mut renderer = GoldyRenderer::new(&device).expect("Failed to create ekrano renderer");
+    eprintln!("Creating ekrano renderer took {:?}", start_create.elapsed());
+
+    let mut window: Option<Arc<Window>> = None;
+    let mut _softbuf_ctx: Option<softbuffer::Context<Arc<Window>>> = None;
+    let mut softbuf: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>> = None;
+
+    let mut scene = Scene::new();
+    let mut fragment = Scene::new();
+    let mut simple_text = RobotoText::new();
+    let mut stats = stats::Stats::new();
+    let mut stats_shown = true;
+
+    let mut frame_start_time = Instant::now();
+    let start = Instant::now();
+
+    let mut touch_state = multi_touch::TouchState::new();
+    let _navigation_fingers: HashSet<u64> = HashSet::new();
+    let mut transform = Affine::IDENTITY;
+    let mut mouse_down = false;
+    let mut prior_position: Option<Vec2> = None;
+    let mut scene_ix: i32 = 0;
+    let mut complexity: usize = 0;
+    if let Some(set_scene) = args.scene {
+        scene_ix = set_scene;
+    }
+    let mut prev_scene_ix = scene_ix - 1;
+
+    event_loop
+        .run(move |event, event_loop| match event {
+            Event::WindowEvent {
+                ref event,
+                window_id,
+            } => {
+                let Some(win) = &window else { return };
+                if win.id() != window_id {
+                    return;
+                }
+                match event {
+                    WindowEvent::CloseRequested => event_loop.exit(),
+                    WindowEvent::KeyboardInput { event, .. } => {
+                        if event.state == ElementState::Pressed {
+                            match event.logical_key.as_ref() {
+                                Key::Named(NamedKey::ArrowLeft) => {
+                                    scene_ix = scene_ix.saturating_sub(1);
+                                }
+                                Key::Named(NamedKey::ArrowRight) => {
+                                    scene_ix = scene_ix.saturating_add(1);
+                                }
+                                Key::Named(NamedKey::ArrowUp) => complexity += 1,
+                                Key::Named(NamedKey::ArrowDown) => {
+                                    complexity = complexity.saturating_sub(1);
+                                }
+                                Key::Named(NamedKey::Space) => {
+                                    transform = Affine::IDENTITY;
+                                }
+                                Key::Character(char) => {
+                                    let char = char.to_lowercase();
+                                    match char.as_str() {
+                                        "s" => stats_shown = !stats_shown,
+                                        "c" => stats.clear_min_and_max(),
+                                        _ => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    WindowEvent::Resized(size) => {
+                        if let Some(sb) = &mut softbuf {
+                            let _ = sb.resize(
+                                std::num::NonZeroU32::new(size.width).unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
+                                std::num::NonZeroU32::new(size.height).unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
+                            );
+                        }
+                        if let Some(win) = &window {
+                            win.request_redraw();
+                        }
+                    }
+                    WindowEvent::MouseInput { state, button, .. } => {
+                        if button == &MouseButton::Left {
+                            mouse_down = state == &ElementState::Pressed;
+                        }
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        const BASE: f64 = 1.05;
+                        const PIXELS_PER_LINE: f64 = 20.0;
+                        if let Some(prior_position) = prior_position {
+                            let exponent = if let MouseScrollDelta::PixelDelta(delta) = delta {
+                                delta.y / PIXELS_PER_LINE
+                            } else if let MouseScrollDelta::LineDelta(_, y) = delta {
+                                *y as f64
+                            } else {
+                                0.0
+                            };
+                            transform = Affine::translate(prior_position)
+                                * Affine::scale(BASE.powf(exponent))
+                                * Affine::translate(-prior_position)
+                                * transform;
+                        }
+                    }
+                    WindowEvent::CursorLeft { .. } => {
+                        prior_position = None;
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        let position = Vec2::new(position.x, position.y);
+                        if mouse_down && let Some(prior) = prior_position {
+                            transform = Affine::translate(position - prior) * transform;
+                        }
+                        prior_position = Some(position);
+                    }
+                    WindowEvent::RedrawRequested => {
+                        let Some(win) = &window else { return };
+                        let size = win.inner_size();
+                        let width = size.width;
+                        let height = size.height;
+                        if width == 0 || height == 0 {
+                            return;
+                        }
+                        let snapshot = stats.snapshot();
+
+                        scene_ix = scene_ix.rem_euclid(scenes.scenes.len() as i32);
+                        let example_scene = &mut scenes.scenes[scene_ix as usize];
+                        if prev_scene_ix != scene_ix {
+                            transform = Affine::IDENTITY;
+                            prev_scene_ix = scene_ix;
+                            win.set_title(&format!(
+                                "Ekrano demo - {}",
+                                example_scene.config.name
+                            ));
+                        }
+                        fragment.reset();
+                        let mut scene_params = SceneParams {
+                            time: start.elapsed().as_secs_f64(),
+                            text: &mut simple_text,
+                            resolution: None,
+                            base_color: None,
+                            interactive: true,
+                            complexity,
+                        };
+                        example_scene
+                            .function
+                            .render(&mut fragment, &mut scene_params);
+
+                        let base_color = args
+                            .args
+                            .base_color
+                            .or(scene_params.base_color)
+                            .unwrap_or(Color::BLACK);
+                        let render_params = RenderParams {
+                            base_color,
+                            width,
+                            height,
+                            antialiasing_method: ekrano::AaConfig::Area,
+                        };
+                        scene.reset();
+                        let mut transform = transform;
+                        if let Some(resolution) = scene_params.resolution {
+                            let factor = Vec2::new(width as f64, height as f64);
+                            let scale_factor =
+                                (factor.x / resolution.x).min(factor.y / resolution.y);
+                            transform *= Affine::scale(scale_factor);
+                        }
+                        scene.append(&fragment, Some(transform));
+                        if stats_shown {
+                            snapshot.draw_layer(
+                                &mut scene,
+                                &mut simple_text,
+                                width as f64,
+                                height as f64,
+                                stats.samples(),
+                                None,
+                                true,
+                                ekrano::AaConfig::Area,
+                            );
+                        }
+
+                        let pixels_rgba = match renderer.render_to_buffer(
+                            &device,
+                            &scene,
+                            &render_params,
+                        ) {
+                            Ok(buf) => buf,
+                            Err(e) => {
+                                eprintln!("Render error: {e}");
+                                return;
+                            }
+                        };
+
+                        // Present via softbuffer: convert RGBA u8 -> packed u32 (0x00RRGGBB)
+                        if let Some(sb) = &mut softbuf {
+                            let _ = sb.resize(
+                                std::num::NonZeroU32::new(width).unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
+                                std::num::NonZeroU32::new(height).unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
+                            );
+                            let mut buf = sb.buffer_mut().expect("Failed to get softbuffer");
+                            let pixel_count = (width * height) as usize;
+                            for i in 0..pixel_count {
+                                let r = pixels_rgba[i * 4] as u32;
+                                let g = pixels_rgba[i * 4 + 1] as u32;
+                                let b = pixels_rgba[i * 4 + 2] as u32;
+                                buf[i] = (r << 16) | (g << 8) | b;
+                            }
+                            buf.present().expect("Failed to present");
+                        }
+
+                        let new_time = Instant::now();
+                        stats.add_sample(stats::Sample {
+                            frame_time_us: (new_time - frame_start_time).as_micros() as u64,
+                        });
+                        frame_start_time = new_time;
+                    }
+                    _ => {}
+                }
+            }
+            Event::AboutToWait => {
+                touch_state.end_frame();
+                let touch_info = touch_state.info();
+                if let Some(touch_info) = touch_info {
+                    let centre = Vec2::new(touch_info.zoom_centre.x, touch_info.zoom_centre.y);
+                    transform = Affine::translate(touch_info.translation_delta)
+                        * Affine::translate(centre)
+                        * Affine::scale(touch_info.zoom_delta)
+                        * Affine::rotate(touch_info.rotation_delta)
+                        * Affine::translate(-centre)
+                        * transform;
+                }
+                if let Some(win) = &window {
+                    win.request_redraw();
+                }
+            }
+            Event::Resumed => {
+                let win = create_ekrano_window(event_loop);
+                let ctx = softbuffer::Context::new(win.clone()).expect("Failed to create softbuffer context");
+                let sb = softbuffer::Surface::new(&ctx, win.clone()).expect("Failed to create softbuffer surface");
+                window = Some(win);
+                _softbuf_ctx = Some(ctx);
+                softbuf = Some(sb);
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+            Event::Suspended => {
+                softbuf = None;
+                _softbuf_ctx = None;
+                window = None;
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            _ => {}
+        })
+        .expect("run to completion");
+}
+
+/// # Panics
+/// Can panic.
+#[cfg(feature = "use_ekrano")]
+pub fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
-    let scenes = args
-        .args
-        .select_scene_set(|| Args::command())
-        .unwrap()
-        .unwrap();
-    let render_cx = RenderContext::new();
-
-    run(event_loop, args, scenes, render_cx);
+    let scenes = args.args.select_scene_set(Args::command)?;
+    if let Some(scenes) = scenes {
+        let event_loop = EventLoopBuilder::<()>::with_user_event().build()?;
+        run_ekrano(event_loop, args, scenes);
+    }
+    Ok(())
 }

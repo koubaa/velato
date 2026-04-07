@@ -9,11 +9,17 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = ["use_vello"]
+use_vello = ["dep:vello", "velato/vello"]
+use_ekrano = ["dep:ekrano", "velato/ekrano"]
+
 [dependencies]
-vello = { workspace = true }
+vello = { workspace = true, optional = true }
+ekrano = { workspace = true, optional = true }
 kurbo = { workspace = true }
 peniko = { workspace = true }
-velato = { path = "../.." }
+velato = { path = "../..", default-features = false }
 anyhow = "1"
 clap = { version = "4.5.38", features = ["derive"] }
 image = "0.24.9"

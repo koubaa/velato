@@ -12,6 +12,9 @@ use std::ops::Range;
 #[cfg(feature = "vello")]
 mod vello;
 
+#[cfg(feature = "ekrano")]
+mod ekrano_sink;
+
 pub mod model;
 
 pub use render::{RenderSink, Renderer};

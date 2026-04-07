@@ -5,8 +5,16 @@ use kurbo::{Affine, PathEl, Rect, Stroke};
 use peniko::{Brush, Color, Fill};
 use scenes::RobotoText;
 use std::collections::VecDeque;
+
+#[cfg(feature = "use_vello")]
 use vello::low_level::BumpAllocators;
+#[cfg(feature = "use_vello")]
 use vello::{AaConfig, Scene};
+
+#[cfg(feature = "use_ekrano")]
+use ekrano::low_level::BumpAllocators;
+#[cfg(feature = "use_ekrano")]
+use ekrano::{AaConfig, Scene};
 
 const SLIDING_WINDOW_SIZE: usize = 100;
 

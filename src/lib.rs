@@ -94,4 +94,8 @@ pub use error::Error;
 #[cfg(feature = "vello")]
 pub use vello;
 
+// Re-export ekrano
+#[cfg(feature = "ekrano")]
+pub use ekrano;
+
 pub use runtime::{Composition, RenderSink, Renderer, model};
