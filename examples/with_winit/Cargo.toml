@@ -22,13 +22,12 @@ workspace = true
 [features]
 default = ["use_vello"]
 use_vello = ["dep:vello", "dep:wgpu", "scenes/use_vello"]
-use_ekrano = ["dep:ekrano", "dep:goldy", "dep:softbuffer", "scenes/use_ekrano"]
+use_ekrano = ["dep:ekrano", "dep:goldy", "scenes/use_ekrano"]
 
 [dependencies]
 vello = { workspace = true, features = ["wgpu"], optional = true }
 ekrano = { workspace = true, optional = true }
 goldy = { workspace = true, optional = true }
-softbuffer = { version = "0.4", optional = true }
 kurbo = { workspace = true }
 peniko = { workspace = true }
 wgpu = { version = "27.0", features = ["vulkan", "metal", "dx12"], optional = true }
@@ -40,6 +39,14 @@ pollster = "0.3"
 winit = "0.29.15"
 env_logger = "0.11.8"
 log = "0.4.27"
+# When the ekrano path is active, goldy's diagnostics use the `tracing` crate;
+# without this subscriber, the only thing that reaches stderr on a GPU error is
+# the short `anyhow::bail!` string — the richer `localizedDescription` from
+# Metal's completion handler is silently dropped. The subscriber reads the same
+# `RUST_LOG` filter as env_logger so existing invocations keep working.
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = { version = "0.2" }
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 vello = { workspace = true, features = ["hot_reload", "wgpu"], optional = true }

@@ -641,8 +641,24 @@ fn run_ekrano(
     use winit::event::*;
     use winit::event_loop::ControlFlow;
     use winit::keyboard::*;
-    use goldy::{DeviceType, Instance};
+    use goldy::{DeviceType, Instance, PresentMode, Surface, SurfaceConfig};
     use ekrano::{GoldyRenderer, RenderParams};
+
+    // Force a backtrace on any panic so we can diagnose crashes from user input
+    // without requiring RUST_BACKTRACE to be set in the environment.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        // SAFETY: set_var is only unsafe on some platforms (multi-threaded env),
+        // but we're before any thread spawns here.
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+    }
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("\n===== PANIC in run_ekrano =====");
+        eprintln!("{info}");
+        eprintln!("Backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+        eprintln!("================================\n");
+        prev_hook(info);
+    }));
 
     let instance = Instance::new().expect("Failed to create Goldy instance");
     let device = instance
@@ -656,8 +672,8 @@ fn run_ekrano(
     eprintln!("Creating ekrano renderer took {:?}", start_create.elapsed());
 
     let mut window: Option<Arc<Window>> = None;
-    let mut _softbuf_ctx: Option<softbuffer::Context<Arc<Window>>> = None;
-    let mut softbuf: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>> = None;
+    let mut surface: Option<Surface> = None;
+    let mut vsync = true;
 
     let mut scene = Scene::new();
     let mut fragment = Scene::new();
@@ -673,8 +689,10 @@ fn run_ekrano(
     let mut transform = Affine::IDENTITY;
     let mut mouse_down = false;
     let mut prior_position: Option<Vec2> = None;
+    let mut _modifiers = winit::keyboard::ModifiersState::default();
     let mut scene_ix: i32 = 0;
     let mut complexity: usize = 0;
+    let mut complexity_shown = false;
     if let Some(set_scene) = args.scene {
         scene_ix = set_scene;
     }
@@ -692,6 +710,9 @@ fn run_ekrano(
                 }
                 match event {
                     WindowEvent::CloseRequested => event_loop.exit(),
+                    WindowEvent::ModifiersChanged(m) => {
+                        _modifiers = m.state();
+                    }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if event.state == ElementState::Pressed {
                             match event.logical_key.as_ref() {
@@ -708,11 +729,48 @@ fn run_ekrano(
                                 Key::Named(NamedKey::Space) => {
                                     transform = Affine::IDENTITY;
                                 }
+                                Key::Named(NamedKey::Escape) => event_loop.exit(),
                                 Key::Character(char) => {
                                     let char = char.to_lowercase();
                                     match char.as_str() {
+                                        "q" | "e" => {
+                                            if let Some(prior_position) = prior_position {
+                                                let is_clockwise = char == "e";
+                                                let angle = if is_clockwise { -0.05 } else { 0.05 };
+                                                transform = Affine::translate(prior_position)
+                                                    * Affine::rotate(angle)
+                                                    * Affine::translate(-prior_position)
+                                                    * transform;
+                                            }
+                                        }
                                         "s" => stats_shown = !stats_shown,
                                         "c" => stats.clear_min_and_max(),
+                                        "d" => complexity_shown = !complexity_shown,
+                                        "m" => {
+                                            eprintln!("AA method switching not available in ekrano mode");
+                                        }
+                                        "v" => {
+                                            // Ignore auto-repeat to avoid flipping vsync hundreds of
+                                            // times a second when the user holds the key.
+                                            if event.repeat {
+                                                // no-op
+                                            } else if let Some(surf) = surface.as_mut() {
+                                                vsync = !vsync;
+                                                let mode = if vsync {
+                                                    PresentMode::Fifo
+                                                } else {
+                                                    PresentMode::Immediate
+                                                };
+                                                match surf.set_present_mode(mode) {
+                                                    Ok(()) => eprintln!(
+                                                        "Vsync: {} (present mode: {:?})",
+                                                        if vsync { "ON" } else { "OFF" },
+                                                        mode
+                                                    ),
+                                                    Err(e) => eprintln!("Failed to set present mode: {e}"),
+                                                }
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -721,11 +779,8 @@ fn run_ekrano(
                         }
                     }
                     WindowEvent::Resized(size) => {
-                        if let Some(sb) = &mut softbuf {
-                            let _ = sb.resize(
-                                std::num::NonZeroU32::new(size.width).unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
-                                std::num::NonZeroU32::new(size.height).unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
-                            );
+                        if let Some(surf) = &mut surface {
+                            let _ = surf.resize(size.width.max(1), size.height.max(1));
                         }
                         if let Some(win) = &window {
                             win.request_redraw();
@@ -753,6 +808,9 @@ fn run_ekrano(
                                 * transform;
                         }
                     }
+                    WindowEvent::Touch(touch) => {
+                        touch_state.add_event(touch);
+                    }
                     WindowEvent::CursorLeft { .. } => {
                         prior_position = None;
                     }
@@ -765,9 +823,8 @@ fn run_ekrano(
                     }
                     WindowEvent::RedrawRequested => {
                         let Some(win) = &window else { return };
-                        let size = win.inner_size();
-                        let width = size.width;
-                        let height = size.height;
+                        let Some(surf) = surface.as_mut() else { return };
+                        let (width, height) = surf.size();
                         if width == 0 || height == 0 {
                             return;
                         }
@@ -824,38 +881,48 @@ fn run_ekrano(
                                 height as f64,
                                 stats.samples(),
                                 None,
-                                true,
+                                vsync,
                                 ekrano::AaConfig::Area,
                             );
                         }
 
-                        let pixels_rgba = match renderer.render_to_buffer(
-                            &device,
-                            &scene,
-                            &render_params,
-                        ) {
-                            Ok(buf) => buf,
+                        let frame = match surf.acquire() {
+                            Ok(f) => f,
                             Err(e) => {
-                                eprintln!("Render error: {e}");
+                                eprintln!("surface.acquire error: {e}");
                                 return;
                             }
                         };
-
-                        // Present via softbuffer: convert RGBA u8 -> packed u32 (0x00RRGGBB)
-                        if let Some(sb) = &mut softbuf {
-                            let _ = sb.resize(
-                                std::num::NonZeroU32::new(width).unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
-                                std::num::NonZeroU32::new(height).unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
-                            );
-                            let mut buf = sb.buffer_mut().expect("Failed to get softbuffer");
-                            let pixel_count = (width * height) as usize;
-                            for i in 0..pixel_count {
-                                let r = pixels_rgba[i * 4] as u32;
-                                let g = pixels_rgba[i * 4 + 1] as u32;
-                                let b = pixels_rgba[i * 4 + 2] as u32;
-                                buf[i] = (r << 16) | (g << 8) | b;
+                        let frame_tex = match frame.texture() {
+                            Some(t) => t.clone(),
+                            None => {
+                                eprintln!("Backend does not expose surface frame textures");
+                                return;
                             }
-                            buf.present().expect("Failed to present");
+                        };
+                        let render_result = renderer.render_to_texture(
+                            &device, &scene, &frame_tex, &render_params,
+                        );
+                        // Always drop the borrowed texture handle and present the
+                        // frame, even on render error: otherwise the drawable stays
+                        // retained by the Metal layer and `nextDrawable` starves
+                        // after 3 frames, turning a recoverable render error into
+                        // an unrecoverable `surface.acquire` hang.
+                        drop(frame_tex);
+                        if let Err(e) = frame.present() {
+                            eprintln!("surface.present error: {e}");
+                        }
+                        if let Err(e) = render_result {
+                            eprintln!("Render error: {e}");
+                            // `GPU device is lost` means a prior wait_fence timed out
+                            // and the device is permanently wedged. Every subsequent
+                            // frame will fail the same way; exit so the user isn't
+                            // flooded with identical errors.
+                            if e.to_string().contains("GPU device is lost") {
+                                eprintln!("GPU is wedged — exiting");
+                                event_loop.exit();
+                            }
+                            return;
                         }
 
                         let new_time = Instant::now();
@@ -885,16 +952,22 @@ fn run_ekrano(
             }
             Event::Resumed => {
                 let win = create_ekrano_window(event_loop);
-                let ctx = softbuffer::Context::new(win.clone()).expect("Failed to create softbuffer context");
-                let sb = softbuffer::Surface::new(&ctx, win.clone()).expect("Failed to create softbuffer surface");
+                let initial_mode = if vsync { PresentMode::Fifo } else { PresentMode::Immediate };
+                let surf = Surface::new_with_config(
+                    &device,
+                    win.as_ref(),
+                    SurfaceConfig {
+                        present_mode: initial_mode,
+                        depth_format: None,
+                    },
+                )
+                .expect("Failed to create goldy surface");
                 window = Some(win);
-                _softbuf_ctx = Some(ctx);
-                softbuf = Some(sb);
+                surface = Some(surf);
                 event_loop.set_control_flow(ControlFlow::Poll);
             }
             Event::Suspended => {
-                softbuf = None;
-                _softbuf_ctx = None;
+                surface = None;
                 window = None;
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
@@ -907,7 +980,25 @@ fn run_ekrano(
 /// Can panic.
 #[cfg(feature = "use_ekrano")]
 pub fn main() -> Result<()> {
-    env_logger::init();
+    // Goldy logs its GPU diagnostics (timeouts, completion-handler errors,
+    // descriptor encode paths) via `tracing`. `env_logger` only understands
+    // the `log` crate, so those events never reach the terminal. Installing
+    // a tracing-subscriber fmt layer that honors `RUST_LOG` surfaces them.
+    // Default to `warn` so a plain `cargo run` produces clean stdout suitable
+    // for FPS comparisons against upstream vello. Goldy / ekrano startup
+    // tracing and per-frame perf heartbeats are still reachable via
+    // `RUST_LOG=goldy=info,ekrano=debug` or similar.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .try_init()
+        .ok();
+    // Route `log::*` records into the tracing subscriber so legacy callers
+    // (velato itself, scenes, etc.) interleave with goldy's tracing output
+    // rather than disappearing.
+    let _ = tracing_log::LogTracer::init();
     let args = Args::parse();
     let scenes = args.args.select_scene_set(Args::command)?;
     if let Some(scenes) = scenes {
