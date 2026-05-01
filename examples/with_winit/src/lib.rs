@@ -690,6 +690,7 @@ fn run_ekrano(
     let mut mouse_down = false;
     let mut prior_position: Option<Vec2> = None;
     let mut _modifiers = winit::keyboard::ModifiersState::default();
+    let mut device_lost = false;
     let mut scene_ix: i32 = 0;
     let mut complexity: usize = 0;
     let mut complexity_shown = false;
@@ -709,7 +710,9 @@ fn run_ekrano(
                     return;
                 }
                 match event {
-                    WindowEvent::CloseRequested => event_loop.exit(),
+                    WindowEvent::CloseRequested => {
+                        event_loop.exit();
+                    }
                     WindowEvent::ModifiersChanged(m) => {
                         _modifiers = m.state();
                     }
@@ -729,7 +732,9 @@ fn run_ekrano(
                                 Key::Named(NamedKey::Space) => {
                                     transform = Affine::IDENTITY;
                                 }
-                                Key::Named(NamedKey::Escape) => event_loop.exit(),
+                                Key::Named(NamedKey::Escape) => {
+                                    event_loop.exit();
+                                }
                                 Key::Character(char) => {
                                     let char = char.to_lowercase();
                                     match char.as_str() {
@@ -822,6 +827,9 @@ fn run_ekrano(
                         prior_position = Some(position);
                     }
                     WindowEvent::RedrawRequested => {
+                        if device_lost {
+                            return;
+                        }
                         let Some(win) = &window else { return };
                         let Some(surf) = surface.as_mut() else { return };
                         let (width, height) = surf.size();
@@ -890,6 +898,14 @@ fn run_ekrano(
                             Ok(f) => f,
                             Err(e) => {
                                 eprintln!("surface.acquire error: {e}");
+                                let error_text = e.to_string();
+                                if error_text.contains("Failed to wait for frame fence")
+                                    || error_text.contains("DEVICE_LOST")
+                                    || error_text.contains("device lost")
+                                {
+                                    device_lost = true;
+                                    event_loop.exit();
+                                }
                                 return;
                             }
                         };
@@ -912,17 +928,26 @@ fn run_ekrano(
                         if let Err(e) = frame.present() {
                             eprintln!("surface.present error: {e}");
                         }
-                        if let Err(e) = render_result {
-                            eprintln!("Render error: {e}");
-                            // `GPU device is lost` means a prior wait_fence timed out
-                            // and the device is permanently wedged. Every subsequent
-                            // frame will fail the same way; exit so the user isn't
-                            // flooded with identical errors.
-                            if e.to_string().contains("GPU device is lost") {
-                                eprintln!("GPU is wedged — exiting");
-                                event_loop.exit();
+                        match render_result {
+                            Ok(stats) if stats.bump_retries > 0 => {
+                                eprintln!(
+                                    "[BUMP] bump allocator reallocated {} time(s) this frame",
+                                    stats.bump_retries,
+                                );
                             }
-                            return;
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("Render error: {e}");
+                                // `GPU device is lost` means a prior wait_fence timed out
+                                // and the device is permanently wedged. Every subsequent
+                                // frame will fail the same way; exit so the user isn't
+                                // flooded with identical errors.
+                                if e.to_string().contains("GPU device is lost") {
+                                    eprintln!("GPU is wedged — exiting");
+                                    event_loop.exit();
+                                }
+                                return;
+                            }
                         }
 
                         let new_time = Instant::now();
@@ -970,6 +995,16 @@ fn run_ekrano(
                 surface = None;
                 window = None;
                 event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Event::LoopExiting => {
+                // When device is lost, drop the surface (and window) here so that
+                // surface cleanup runs while the device is still in the devices map.
+                // This ensures all Vulkan child objects are destroyed before
+                // vkDestroyDevice is called, avoiding VUID-vkDestroyDevice-device-05137.
+                if device_lost {
+                    surface = None;
+                    window = None;
+                }
             }
             _ => {}
         })

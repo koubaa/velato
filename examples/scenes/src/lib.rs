@@ -131,7 +131,7 @@ impl Arguments {
             } else if let Some(lotties) = &self.lotties {
                 scene_from_files(lotties)
             } else {
-                default_scene(command)
+                Ok(test_scenes())
             }
             .map(Some)
         }
