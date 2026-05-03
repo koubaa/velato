@@ -73,6 +73,12 @@ renderer.render(&composition, frame, transform, alpha, &mut new_scene);
 cargo run -p with_winit
 ```
 
+With ekrano backend
+
+```shell
+cargo run -p with_winit --release --no-default-features --features use_ekrano --bin with_winit_bin
+```
+
 You can also load an entire folder or individual files.
 
 ```shell
