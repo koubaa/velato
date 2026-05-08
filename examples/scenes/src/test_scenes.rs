@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::{ExampleScene, SceneConfig, SceneParams, SceneSet};
+#[cfg(feature = "use_ekrano")]
+use ekrano::*;
 use kurbo::Affine;
 #[cfg(feature = "use_vello")]
 use vello::*;
-#[cfg(feature = "use_ekrano")]
-use ekrano::*;
 
 macro_rules! scene {
     ($name: ident) => {

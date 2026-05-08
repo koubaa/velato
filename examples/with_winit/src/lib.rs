@@ -617,9 +617,7 @@ pub fn main() -> Result<()> {
 // Ekrano backend
 // ---------------------------------------------------------------------------
 #[cfg(feature = "use_ekrano")]
-fn create_ekrano_window(
-    event_loop: &winit::event_loop::EventLoopWindowTarget<()>,
-) -> Arc<Window> {
+fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()>) -> Arc<Window> {
     use winit::dpi::LogicalSize;
     use winit::window::WindowBuilder;
     Arc::new(
@@ -633,16 +631,12 @@ fn create_ekrano_window(
 }
 
 #[cfg(feature = "use_ekrano")]
-fn run_ekrano(
-    event_loop: EventLoop<()>,
-    args: Args,
-    mut scenes: SceneSet,
-) {
+fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
+    use ekrano::{GoldyRenderer, RenderParams};
+    use goldy::{DeviceType, Instance, PresentMode, Surface, SurfaceConfig};
     use winit::event::*;
     use winit::event_loop::ControlFlow;
     use winit::keyboard::*;
-    use goldy::{DeviceType, Instance, PresentMode, Surface, SurfaceConfig};
-    use ekrano::{GoldyRenderer, RenderParams};
 
     // Force a backtrace on any panic so we can diagnose crashes from user input
     // without requiring RUST_BACKTRACE to be set in the environment.
@@ -752,7 +746,9 @@ fn run_ekrano(
                                         "c" => stats.clear_min_and_max(),
                                         "d" => complexity_shown = !complexity_shown,
                                         "m" => {
-                                            eprintln!("AA method switching not available in ekrano mode");
+                                            eprintln!(
+                                                "AA method switching not available in ekrano mode"
+                                            );
                                         }
                                         "v" => {
                                             // Ignore auto-repeat to avoid flipping vsync hundreds of
@@ -772,7 +768,9 @@ fn run_ekrano(
                                                         if vsync { "ON" } else { "OFF" },
                                                         mode
                                                     ),
-                                                    Err(e) => eprintln!("Failed to set present mode: {e}"),
+                                                    Err(e) => {
+                                                        eprintln!("Failed to set present mode: {e}")
+                                                    }
                                                 }
                                             }
                                         }
@@ -843,10 +841,7 @@ fn run_ekrano(
                         if prev_scene_ix != scene_ix {
                             transform = Affine::IDENTITY;
                             prev_scene_ix = scene_ix;
-                            win.set_title(&format!(
-                                "Ekrano demo - {}",
-                                example_scene.config.name
-                            ));
+                            win.set_title(&format!("Ekrano demo - {}", example_scene.config.name));
                         }
                         fragment.reset();
                         let mut scene_params = SceneParams {
@@ -909,16 +904,9 @@ fn run_ekrano(
                                 return;
                             }
                         };
-                        let frame_tex = match frame.texture() {
-                            Some(t) => t.clone(),
-                            None => {
-                                eprintln!("Backend does not expose surface frame textures");
-                                return;
-                            }
-                        };
-                        let render_result = renderer.render_to_texture(
-                            &device, &scene, &frame_tex, &render_params,
-                        );
+                        let frame_tex = frame.texture().clone();
+                        let render_result =
+                            renderer.render_to_texture(&device, &scene, &frame_tex, &render_params);
                         // Always drop the borrowed texture handle and present the
                         // frame, even on render error: otherwise the drawable stays
                         // retained by the Metal layer and `nextDrawable` starves
@@ -977,7 +965,11 @@ fn run_ekrano(
             }
             Event::Resumed => {
                 let win = create_ekrano_window(event_loop);
-                let initial_mode = if vsync { PresentMode::Fifo } else { PresentMode::Immediate };
+                let initial_mode = if vsync {
+                    PresentMode::Fifo
+                } else {
+                    PresentMode::Immediate
+                };
                 let surf = Surface::new_with_config(
                     &device,
                     win.as_ref(),

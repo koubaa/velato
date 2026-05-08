@@ -6,6 +6,8 @@ use crate::SceneParams;
 use crate::{ExampleScene, SceneSet};
 #[cfg(not(target_arch = "wasm32"))]
 use anyhow::{Ok, Result};
+#[cfg(feature = "use_ekrano")]
+use ekrano::Scene;
 use instant::Instant;
 use kurbo::{Affine, Vec2};
 use std::sync::Arc;
@@ -17,8 +19,6 @@ use std::{
 use velato::Composition;
 #[cfg(feature = "use_vello")]
 use vello::Scene;
-#[cfg(feature = "use_ekrano")]
-use ekrano::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn scene_from_files(files: &[PathBuf]) -> Result<SceneSet> {

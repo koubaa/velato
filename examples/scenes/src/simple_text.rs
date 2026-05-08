@@ -1,6 +1,8 @@
 // Copyright 2022 the Velato Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+#[cfg(feature = "use_ekrano")]
+use ekrano::{Glyph, Scene};
 use kurbo::Affine;
 use peniko::{Blob, Brush, BrushRef, FontData, StyleRef};
 use skrifa::MetadataProvider;
@@ -8,8 +10,6 @@ use skrifa::raw::FontRef;
 use std::sync::Arc;
 #[cfg(feature = "use_vello")]
 use vello::{Glyph, Scene};
-#[cfg(feature = "use_ekrano")]
-use ekrano::{Glyph, Scene};
 
 // This is very much a hack to get things working.
 // On Windows, can set this to "c:\\Windows\\Fonts\\seguiemj.ttf" to get color
