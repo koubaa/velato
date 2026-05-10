@@ -69,6 +69,12 @@ struct Args {
     /// Use `0` for an automatic choice
     #[arg(long, default_value_t=default_threads())]
     num_init_threads: usize,
+    /// Disable vsync (use Immediate / AutoNoVsync present mode)
+    #[arg(long)]
+    no_vsync: bool,
+    /// Auto-exit after this many seconds
+    #[arg(long)]
+    timeout_secs: Option<u64>,
 }
 
 fn default_threads() -> usize {
@@ -141,7 +147,8 @@ fn run(
     #[allow(unused_mut)]
     let mut scene_complexity: Option<BumpAllocators> = None;
     let mut complexity_shown = false;
-    let mut vsync_on = true;
+    let mut vsync_on = !args.no_vsync;
+    let auto_exit_deadline = args.timeout_secs.map(|s| Instant::now() + std::time::Duration::from_secs(s));
 
     const AA_CONFIGS: [AaConfig; 3] = [AaConfig::Area, AaConfig::Msaa8, AaConfig::Msaa16];
     // We allow cycling through AA configs in either direction, so use a signed
@@ -484,6 +491,12 @@ fn run(
                         * transform;
                 }
 
+                if let Some(deadline) = auto_exit_deadline {
+                    if Instant::now() >= deadline {
+                        event_loop.exit();
+                        return;
+                    }
+                }
                 if let Some(render_state) = &mut render_state {
                     render_state.window.request_redraw();
                 }
@@ -531,7 +544,7 @@ fn run(
                         window.clone(),
                         size.width,
                         size.height,
-                        wgpu::PresentMode::AutoVsync,
+                        if vsync_on { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync },
                     );
                     // We need to block here, in case a Suspended event appeared
                     let surface =
@@ -586,12 +599,43 @@ enum UserEvent {
     HotReload,
 }
 
+/// Writes a small JSON file identifying the active backend, PID, and timestamp.
+/// If `BACKEND_DUMP_DIR` is set, the file is written there; otherwise it goes to
+/// the current directory.
+fn dump_backend_info(backend: &str) {
+    use std::io::Write;
+    let dir = std::env::var("BACKEND_DUMP_DIR")
+        .unwrap_or_else(|_| "/Users/mohamedkoubaa/dev/KOB3/scratch".to_string());
+    let path = std::path::Path::new(&dir).join(format!("{backend}_backend.json"));
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    match std::fs::File::create(&path) {
+        Ok(mut f) => {
+            let _ = writeln!(
+                f,
+                r#"{{"backend":"{backend}","pid":{},"unix_ts":{ts}}}"#,
+                std::process::id(),
+            );
+            println!("[with_winit] Backend dump written to {}", path.display());
+        }
+        Err(e) => {
+            println!(
+                "[with_winit] FAILED to write backend dump to {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// # Panics
 /// Can panic.
 #[cfg(feature = "use_vello")]
 pub fn main() -> Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
+    dump_backend_info("vello");
     let args = Args::parse();
     let scenes = args.args.select_scene_set(Args::command)?;
     if let Some(scenes) = scenes {
@@ -667,7 +711,8 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
 
     let mut window: Option<Arc<Window>> = None;
     let mut surface: Option<Surface> = None;
-    let mut vsync = true;
+    let mut vsync = !args.no_vsync;
+    let auto_exit_deadline = args.timeout_secs.map(|s| Instant::now() + std::time::Duration::from_secs(s));
 
     let mut scene = Scene::new();
     let mut fragment = Scene::new();
@@ -962,6 +1007,12 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                         * Affine::translate(-centre)
                         * transform;
                 }
+                if let Some(deadline) = auto_exit_deadline {
+                    if Instant::now() >= deadline {
+                        event_loop.exit();
+                        return;
+                    }
+                }
                 if let Some(win) = &window {
                     win.request_redraw();
                 }
@@ -1010,6 +1061,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
 /// Can panic.
 #[cfg(feature = "use_ekrano")]
 pub fn main() -> Result<()> {
+    eprintln!("=== EKRANO BACKEND ACTIVE (pid {}) ===", std::process::id());
     // Goldy logs its GPU diagnostics (timeouts, completion-handler errors,
     // descriptor encode paths) via `tracing`. `env_logger` only understands
     // the `log` crate, so those events never reach the terminal. Installing
@@ -1029,6 +1081,7 @@ pub fn main() -> Result<()> {
     // (velato itself, scenes, etc.) interleave with goldy's tracing output
     // rather than disappearing.
     let _ = tracing_log::LogTracer::init();
+    dump_backend_info("ekrano");
     let args = Args::parse();
     let scenes = args.args.select_scene_set(Args::command)?;
     if let Some(scenes) = scenes {
