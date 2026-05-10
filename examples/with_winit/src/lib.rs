@@ -866,6 +866,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                             width,
                             height,
                             antialiasing_method: ekrano::AaConfig::Area,
+                            robust: false,
                         };
                         scene.reset();
                         let mut transform = transform;
@@ -889,6 +890,14 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                             );
                         }
 
+                        // Drain the previous frame's GPU work BEFORE acquiring
+                        // the next drawable. This ensures the previous frame's
+                        // drawable is recycled, so nextDrawable returns
+                        // immediately instead of blocking on an exhausted pool.
+                        if let Err(e) = renderer.drain_previous_frame(&device) {
+                            eprintln!("drain_previous_frame error: {e}");
+                        }
+
                         let frame = match surf.acquire() {
                             Ok(f) => f,
                             Err(e) => {
@@ -904,16 +913,20 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                                 return;
                             }
                         };
-                        let frame_tex = frame.texture().clone();
                         let render_result =
-                            renderer.render_to_texture(&device, &scene, &frame_tex, &render_params);
-                        // Always drop the borrowed texture handle and present the
-                        // frame, even on render error: otherwise the drawable stays
-                        // retained by the Metal layer and `nextDrawable` starves
-                        // after 3 frames, turning a recoverable render error into
-                        // an unrecoverable `surface.acquire` hang.
-                        drop(frame_tex);
-                        if let Err(e) = frame.present() {
+                            renderer.render_to_frame(&device, &scene, &frame, &render_params);
+                        // Always present the frame, even on render error:
+                        // otherwise the drawable stays retained by the Metal
+                        // layer and `nextDrawable` starves after 3 frames,
+                        // turning a recoverable render error into an
+                        // unrecoverable `surface.acquire` hang.
+                        let present_result = frame.present();
+                        if let Ok(tv) = &present_result {
+                            if let Err(e) = renderer.note_frame_presented(*tv) {
+                                eprintln!("note_frame_presented error: {e}");
+                            }
+                        }
+                        if let Err(e) = present_result {
                             eprintln!("surface.present error: {e}");
                         }
                         match render_result {
