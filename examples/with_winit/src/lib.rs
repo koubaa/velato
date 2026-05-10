@@ -890,14 +890,6 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                             );
                         }
 
-                        // Drain the previous frame's GPU work BEFORE acquiring
-                        // the next drawable. This ensures the previous frame's
-                        // drawable is recycled, so nextDrawable returns
-                        // immediately instead of blocking on an exhausted pool.
-                        if let Err(e) = renderer.drain_previous_frame(&device) {
-                            eprintln!("drain_previous_frame error: {e}");
-                        }
-
                         let frame = match surf.acquire() {
                             Ok(f) => f,
                             Err(e) => {
@@ -922,9 +914,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                         // unrecoverable `surface.acquire` hang.
                         let present_result = frame.present();
                         if let Ok(tv) = &present_result {
-                            if let Err(e) = renderer.note_frame_presented(*tv) {
-                                eprintln!("note_frame_presented error: {e}");
-                            }
+                            renderer.note_frame_presented(*tv);
                         }
                         if let Err(e) = present_result {
                             eprintln!("surface.present error: {e}");
