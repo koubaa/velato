@@ -600,12 +600,13 @@ enum UserEvent {
 }
 
 /// Writes a small JSON file identifying the active backend, PID, and timestamp.
-/// If `BACKEND_DUMP_DIR` is set, the file is written there; otherwise it goes to
-/// the current directory.
+/// Only runs when `BACKEND_DUMP_DIR` is explicitly set in the environment;
+/// silently skipped otherwise so non-developer runs are unaffected.
 fn dump_backend_info(backend: &str) {
     use std::io::Write;
-    let dir = std::env::var("BACKEND_DUMP_DIR")
-        .unwrap_or_else(|_| "/Users/mohamedkoubaa/dev/KOB3/scratch".to_string());
+    let Ok(dir) = std::env::var("BACKEND_DUMP_DIR") else {
+        return;
+    };
     let path = std::path::Path::new(&dir).join(format!("{backend}_backend.json"));
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -963,6 +964,17 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                         }
                         if let Err(e) = present_result {
                             eprintln!("surface.present error: {e}");
+                            let s = e.to_string();
+                            if s.contains("0x887A0005")
+                                || s.contains("DEVICE_REMOVED")
+                                || s.contains("device removed")
+                                || s.contains("DEVICE_LOST")
+                                || s.contains("device lost")
+                            {
+                                device_lost = true;
+                                event_loop.exit();
+                                return;
+                            }
                         }
                         match render_result {
                             Ok(stats) if stats.bump_retries > 0 => {
@@ -1043,14 +1055,16 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             Event::LoopExiting => {
-                // When device is lost, drop the surface (and window) here so that
-                // surface cleanup runs while the device is still in the devices map.
-                // This ensures all Vulkan child objects are destroyed before
-                // vkDestroyDevice is called, avoiding VUID-vkDestroyDevice-device-05137.
-                if device_lost {
-                    surface = None;
-                    window = None;
-                }
+                // Always drop the surface and window here — before the event-loop
+                // closure itself is dropped — so that Surface::drop runs its
+                // backend.destroy_surface() call while the device handle is still
+                // live in the backend's state map.  Without this, the Rust drop
+                // order inside the closure is unspecified relative to the device,
+                // and the Vulkan validation layer reports undestroyed child objects
+                // (VkDescriptorPool, VkCommandPool) at vkDestroyDevice time
+                // (VUID-vkDestroyDevice-device-05137).
+                surface = None;
+                window = None;
             }
             _ => {}
         })
