@@ -7,3 +7,5 @@ examples/assets/downloads/*
 
 # Some people have Apple
 .DS_Store
+
+metal-traces/

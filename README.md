@@ -85,6 +85,46 @@ You can also load an entire folder or individual files.
 cargo run -p with_winit -- examples/assets
 ```
 
+### Profiling and Metal traces (macOS)
+
+For benchmarking or Xcode Instruments (**Metal System Trace**, **Allocations**), disable vsync so the frame loop is not gated on the display. Pass `--no-vsync` after `--` (everything after `--` goes to the example binary):
+
+```shell
+cargo run -p with_winit --release --bin with_winit_bin -- --no-vsync
+cargo run -p with_winit --release --no-default-features --features use_ekrano --bin with_winit_bin -- --no-vsync
+```
+
+To compare **Vello (default)** vs **Ekrano** without one release build overwriting the other, use distinct target directories:
+
+```shell
+cargo build -p with_winit --release --bin with_winit_bin --target-dir target/trace-vello
+cargo build -p with_winit --release --no-default-features --features use_ekrano --bin with_winit_bin --target-dir target/trace-ekrano
+```
+
+Then record traces with `xctrace` from the Xcode command-line tools (`--timeout-secs` exits the demo after a steady window):
+
+```shell
+mkdir -p metal-traces
+
+xcrun xctrace record --template 'Metal System Trace' --time-limit 14s --no-prompt \
+  --output metal-traces/vello-metal-system.trace --launch -- \
+  target/trace-vello/release/with_winit_bin --timeout-secs 12 --no-vsync
+
+xcrun xctrace record --template 'Metal System Trace' --time-limit 14s --no-prompt \
+  --output metal-traces/ekrano-metal-system.trace --launch -- \
+  target/trace-ekrano/release/with_winit_bin --timeout-secs 12 --no-vsync
+
+xcrun xctrace record --template 'Allocations' --time-limit 14s --no-prompt \
+  --output metal-traces/vello-allocations.trace --launch -- \
+  target/trace-vello/release/with_winit_bin --timeout-secs 12 --no-vsync
+
+xcrun xctrace record --template 'Allocations' --time-limit 14s --no-prompt \
+  --output metal-traces/ekrano-allocations.trace --launch -- \
+  target/trace-ekrano/release/with_winit_bin --timeout-secs 12 --no-vsync
+```
+
+Open the `.trace` bundles in **Instruments** after recording. Run the commands above from the Velato workspace root (the directory that contains Velato’s top-level `Cargo.toml`).
+
 ### Web platform
 
 Because Vello relies heavily on compute shaders, we rely on the emerging WebGPU standard to run on the web.
