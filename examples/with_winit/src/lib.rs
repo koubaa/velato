@@ -960,7 +960,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                         // unrecoverable `surface.acquire` hang.
                         let present_result = frame.present();
                         if let Ok(tv) = &present_result {
-                            renderer.note_frame_presented(*tv);
+                            renderer.note_frame_presented(&device, *tv);
                         }
                         if let Err(e) = present_result {
                             eprintln!("surface.present error: {e}");
