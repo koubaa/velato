@@ -5,7 +5,7 @@ use crate::{ExampleScene, SceneConfig, SceneParams, SceneSet};
 #[cfg(feature = "use_ekrano")]
 use ekrano::*;
 use kurbo::Affine;
-#[cfg(feature = "use_vello")]
+#[cfg(all(feature = "use_vello", not(feature = "use_ekrano")))]
 use vello::*;
 
 macro_rules! scene {

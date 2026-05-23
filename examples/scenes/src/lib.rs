@@ -42,7 +42,7 @@ use peniko::{Color, color};
 
 #[cfg(feature = "use_ekrano")]
 use ekrano::Scene;
-#[cfg(feature = "use_vello")]
+#[cfg(all(feature = "use_vello", not(feature = "use_ekrano")))]
 use vello::Scene;
 
 pub struct SceneParams<'a> {

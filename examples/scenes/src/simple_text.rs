@@ -8,7 +8,7 @@ use peniko::{Blob, Brush, BrushRef, FontData, StyleRef};
 use skrifa::MetadataProvider;
 use skrifa::raw::FontRef;
 use std::sync::Arc;
-#[cfg(feature = "use_vello")]
+#[cfg(all(feature = "use_vello", not(feature = "use_ekrano")))]
 use vello::{Glyph, Scene};
 
 // This is very much a hack to get things working.

@@ -23,6 +23,7 @@ workspace = true
 default = ["use_vello"]
 use_vello = ["dep:vello", "dep:wgpu", "scenes/use_vello"]
 use_ekrano = ["dep:ekrano", "dep:goldy", "scenes/use_ekrano"]
+tracy = ["use_ekrano", "ekrano/tracy", "goldy/tracy"]
 
 [dependencies]
 vello = { workspace = true, features = ["wgpu"], optional = true }

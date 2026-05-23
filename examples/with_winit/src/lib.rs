@@ -148,7 +148,9 @@ fn run(
     let mut scene_complexity: Option<BumpAllocators> = None;
     let mut complexity_shown = false;
     let mut vsync_on = !args.no_vsync;
-    let auto_exit_deadline = args.timeout_secs.map(|s| Instant::now() + std::time::Duration::from_secs(s));
+    let auto_exit_deadline = args
+        .timeout_secs
+        .map(|s| Instant::now() + std::time::Duration::from_secs(s));
 
     const AA_CONFIGS: [AaConfig; 3] = [AaConfig::Area, AaConfig::Msaa8, AaConfig::Msaa16];
     // We allow cycling through AA configs in either direction, so use a signed
@@ -544,7 +546,11 @@ fn run(
                         window.clone(),
                         size.width,
                         size.height,
-                        if vsync_on { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync },
+                        if vsync_on {
+                            wgpu::PresentMode::AutoVsync
+                        } else {
+                            wgpu::PresentMode::AutoNoVsync
+                        },
                     );
                     // We need to block here, in case a Suspended event appeared
                     let surface =
@@ -713,7 +719,9 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
     let mut window: Option<Arc<Window>> = None;
     let mut surface: Option<Surface> = None;
     let mut vsync = !args.no_vsync;
-    let auto_exit_deadline = args.timeout_secs.map(|s| Instant::now() + std::time::Duration::from_secs(s));
+    let auto_exit_deadline = args
+        .timeout_secs
+        .map(|s| Instant::now() + std::time::Duration::from_secs(s));
 
     let mut scene = Scene::new();
     let mut fragment = Scene::new();
@@ -1055,6 +1063,11 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             Event::LoopExiting => {
+                let snap = stats.snapshot();
+                eprintln!(
+                    "[bench] fps={:.1} frame_ms={:.3} min_ms={:.3} max_ms={:.3}",
+                    snap.fps, snap.frame_time_ms, snap.frame_time_min_ms, snap.frame_time_max_ms
+                );
                 // Always drop the surface and window here — before the event-loop
                 // closure itself is dropped — so that Surface::drop runs its
                 // backend.destroy_surface() call while the device handle is still
