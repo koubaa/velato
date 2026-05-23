@@ -944,45 +944,25 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                             );
                         }
 
-                        let frame = match surf.acquire() {
-                            Ok(f) => f,
-                            Err(e) => {
-                                eprintln!("surface.acquire error: {e}");
-                                let error_text = e.to_string();
-                                if error_text.contains("Failed to wait for frame fence")
-                                    || error_text.contains("DEVICE_LOST")
-                                    || error_text.contains("device lost")
+                        let render_result =
+                            renderer.render_to_surface(&device, &scene, surf, &render_params);
+                        match render_result {
+                            Err(ref e) => {
+                                let s = e.to_string();
+                                if s.contains("0x887A0005")
+                                    || s.contains("DEVICE_REMOVED")
+                                    || s.contains("device removed")
+                                    || s.contains("DEVICE_LOST")
+                                    || s.contains("device lost")
+                                    || s.contains("Failed to wait for frame fence")
                                 {
+                                    eprintln!("render_to_surface device lost: {e}");
                                     device_lost = true;
                                     event_loop.exit();
+                                    return;
                                 }
-                                return;
                             }
-                        };
-                        let render_result =
-                            renderer.render_to_frame(&device, &scene, &frame, &render_params);
-                        // Always present the frame, even on render error:
-                        // otherwise the drawable stays retained by the Metal
-                        // layer and `nextDrawable` starves after 3 frames,
-                        // turning a recoverable render error into an
-                        // unrecoverable `surface.acquire` hang.
-                        let present_result = frame.present();
-                        if let Ok(tv) = &present_result {
-                            renderer.note_frame_presented(&device, *tv);
-                        }
-                        if let Err(e) = present_result {
-                            eprintln!("surface.present error: {e}");
-                            let s = e.to_string();
-                            if s.contains("0x887A0005")
-                                || s.contains("DEVICE_REMOVED")
-                                || s.contains("device removed")
-                                || s.contains("DEVICE_LOST")
-                                || s.contains("device lost")
-                            {
-                                device_lost = true;
-                                event_loop.exit();
-                                return;
-                            }
+                            _ => {}
                         }
                         match render_result {
                             Ok(stats) if stats.bump_retries > 0 => {
