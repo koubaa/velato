@@ -94,13 +94,6 @@ cargo run -p with_winit --release --bin with_winit_bin -- --no-vsync
 cargo run -p with_winit --release --no-default-features --features use_ekrano --bin with_winit_bin -- --no-vsync
 ```
 
-To compare **Vello (default)** vs **Ekrano** without one release build overwriting the other, use distinct target directories:
-
-```shell
-cargo build -p with_winit --release --bin with_winit_bin --target-dir target/trace-vello
-cargo build -p with_winit --release --no-default-features --features use_ekrano --bin with_winit_bin --target-dir target/trace-ekrano
-```
-
 Then record traces with `xctrace` from the Xcode command-line tools (`--timeout-secs` exits the demo after a steady window):
 
 ```shell
