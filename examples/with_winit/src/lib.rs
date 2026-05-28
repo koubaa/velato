@@ -794,6 +794,7 @@ fn drain_commands(
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
 ) -> bool {
+    let _tz = goldy::tracy_zone!("velato.drain_commands");
     loop {
         match cmd_rx.try_recv() {
             Ok(cmd) => {
@@ -871,6 +872,106 @@ fn build_ekrano_scene(
 }
 
 #[cfg(feature = "use_ekrano")]
+enum Presenter {
+    Inline,
+    Threaded {
+        tx: std::sync::mpsc::SyncSender<goldy::Frame>,
+        /// Receives one `()` per presented frame, so TID_RENDER can wait for
+        /// present-N to complete before acquiring image N+1.
+        ack_rx: std::sync::mpsc::Receiver<()>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    },
+}
+
+#[cfg(feature = "use_ekrano")]
+impl Presenter {
+    fn new(device_lost: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Inline
+        } else {
+            // Capacity 0 would be a rendezvous; 1 lets TID_RENDER stay one
+            // frame ahead of TID_PRESENT while still bounding the pipeline.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<goldy::Frame>(1);
+            let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+            let dl = Arc::clone(&device_lost);
+            let handle = std::thread::Builder::new()
+                .name("TID_PRESENT".into())
+                .spawn(move || {
+                    while let Ok(frame) = rx.recv() {
+                        let _tz = goldy::tracy_zone!("frame.present.async");
+                        let result = frame.present();
+                        // Ack before checking error so TID_RENDER can proceed;
+                        // if the channel is closed TID_RENDER has already exited.
+                        let _ = ack_tx.send(());
+                        if let Err(e) = result {
+                            eprintln!("present error (TID_PRESENT): {e}");
+                            if is_device_lost_error(&e) {
+                                dl.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                })
+                .expect("spawn TID_PRESENT");
+            Self::Threaded {
+                tx,
+                ack_rx,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    /// Dispatch a frame to present. Returns `false` if the render loop should exit.
+    ///
+    /// For `Threaded`, this is non-blocking (the channel has capacity 1).
+    /// TID_RENDER must call [`wait_for_present_ack`] before the next
+    /// `submit_prepared` (which internally acquires the next swapchain image).
+    fn send_frame(&self, frame: goldy::Frame, device_lost: &std::sync::atomic::AtomicBool) -> bool {
+        use std::sync::atomic::Ordering;
+
+        let _tz = goldy::tracy_zone!("velato.present_send");
+        match self {
+            Self::Inline => {
+                if let Err(e) = frame.present() {
+                    eprintln!("present error: {e}");
+                    if is_device_lost_error(&e) {
+                        device_lost.store(true, Ordering::Relaxed);
+                        return false;
+                    }
+                }
+                true
+            }
+            Self::Threaded { tx, .. } => tx.send(frame).is_ok(),
+        }
+    }
+
+    /// Block until TID_PRESENT has finished `frame.present()` for the
+    /// previously sent frame. Must be called before the next `submit_prepared`
+    /// because the DX12 backend's acquire reads single-valued surface state
+    /// that `present` also writes — they cannot race.
+    ///
+    /// On `Inline` this is a no-op (present already completed synchronously).
+    fn wait_for_present_ack(&self) -> bool {
+        match self {
+            Self::Inline => true,
+            Self::Threaded { ack_rx, .. } => ack_rx.recv().is_ok(),
+        }
+    }
+
+    fn shutdown(self) {
+        match self {
+            Self::Inline => {}
+            Self::Threaded { tx, mut handle, .. } => {
+                drop(tx);
+                if let Some(handle) = handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "use_ekrano")]
 fn ekrano_render_thread(
     device: goldy::Device,
     mut renderer: ekrano::GoldyRenderer,
@@ -902,9 +1003,16 @@ fn ekrano_render_thread(
     let mut fragment = Scene::new();
     let mut simple_text = RobotoText::new();
     let mut frame_start_time = Instant::now();
+    let presenter = Presenter::new(Arc::clone(&device_lost));
+    let mut present_in_flight = false;
 
     loop {
+        if device_lost.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
         while surface.is_none() {
+            let _tz = goldy::tracy_zone!("velato.wait_surface");
             match cmd_rx.recv() {
                 Ok(cmd) => {
                     if !apply_render_cmd(cmd, &mut surface, &mut input, &stats) {
@@ -926,24 +1034,13 @@ fn ekrano_render_thread(
             continue;
         }
 
+        let _frame = goldy::tracy_zone!("velato.render_frame");
+
         let scene_ix = input.scene_ix.rem_euclid(scenes.scenes.len() as i32);
         if prev_scene_ix != scene_ix {
             input.transform = Affine::IDENTITY;
             prev_scene_ix = scene_ix;
         }
-
-        let render_params = {
-            let stats_guard = stats.lock().expect("stats mutex poisoned");
-            build_ekrano_scene(
-                &mut scene,
-                &mut fragment,
-                &mut scenes,
-                &input,
-                &mut simple_text,
-                &stats_guard,
-                base_color,
-            )
-        };
 
         let prepared = match stash.take() {
             Some(prepared)
@@ -951,18 +1048,46 @@ fn ekrano_render_thread(
             {
                 prepared
             }
-            _ => match renderer.prepare(&scene, &render_params) {
-                Ok(prepared) => prepared,
-                Err(e) => {
-                    eprintln!("Prepare error: {e}");
-                    if is_device_lost_error(&e) {
-                        device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
+            _ => {
+                let render_params = {
+                    let _tz = goldy::tracy_zone!("velato.build_scene_fallback");
+                    let stats_guard = stats.lock().expect("stats mutex poisoned");
+                    build_ekrano_scene(
+                        &mut scene,
+                        &mut fragment,
+                        &mut scenes,
+                        &input,
+                        &mut simple_text,
+                        &stats_guard,
+                        base_color,
+                    )
+                };
+                match renderer.prepare(&scene, &render_params) {
+                    Ok(prepared) => prepared,
+                    Err(e) => {
+                        eprintln!("Prepare error: {e}");
+                        if is_device_lost_error(&e) {
+                            device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
                 }
-            },
+            }
         };
+
+        // Wait for TID_PRESENT to finish the previous present before acquiring
+        // the next swapchain image inside submit_prepared. The DX12 backend
+        // stores current_image_index as single-valued mutable state; present
+        // and acquire cannot race. ekrano.prepare() above is pure CPU and does
+        // not touch the surface, so the overlap window is maximised.
+        if present_in_flight {
+            let _tz = goldy::tracy_zone!("velato.wait_present_ack");
+            if !presenter.wait_for_present_ack() {
+                break;
+            }
+            present_in_flight = false;
+        }
 
         let submit_result = renderer.submit_prepared(&device, prepared, surface_ref);
         let (frame_stats, frame) = match submit_result {
@@ -984,38 +1109,47 @@ fn ekrano_render_thread(
             );
         }
 
+        if !presenter.send_frame(frame, &device_lost) {
+            break;
+        }
+        present_in_flight = true;
+
+        if !drain_commands(&cmd_rx, &mut surface, &mut input, &stats) {
+            break;
+        }
+
         {
-            let stats_guard = stats.lock().expect("stats mutex poisoned");
-            let overlap_params = build_ekrano_scene(
-                &mut scene,
-                &mut fragment,
-                &mut scenes,
-                &input,
-                &mut simple_text,
-                &stats_guard,
-                base_color,
-            );
+            let _overlap = goldy::tracy_zone!("velato.overlap_prepare");
+            let overlap_params = {
+                let _tz = goldy::tracy_zone!("velato.build_scene_overlap");
+                let stats_guard = stats.lock().expect("stats mutex poisoned");
+                build_ekrano_scene(
+                    &mut scene,
+                    &mut fragment,
+                    &mut scenes,
+                    &input,
+                    &mut simple_text,
+                    &stats_guard,
+                    base_color,
+                )
+            };
             stash = renderer.prepare(&scene, &overlap_params).ok();
         }
 
-        if let Err(e) = frame.present() {
-            eprintln!("present error: {e}");
-            if is_device_lost_error(&e) {
-                device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
-                break;
-            }
-            continue;
-        }
-
         let new_time = Instant::now();
-        stats
-            .lock()
-            .expect("stats mutex poisoned")
-            .add_sample(stats::Sample {
-                frame_time_us: (new_time - frame_start_time).as_micros() as u64,
-            });
+        {
+            let _tz = goldy::tracy_zone!("velato.record_stats");
+            stats
+                .lock()
+                .expect("stats mutex poisoned")
+                .add_sample(stats::Sample {
+                    frame_time_us: (new_time - frame_start_time).as_micros() as u64,
+                });
+        }
         frame_start_time = new_time;
     }
+
+    presenter.shutdown();
 }
 
 #[cfg(feature = "use_ekrano")]
@@ -1101,7 +1235,9 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
 
     let send_cmd = |tx: &Option<Sender<RenderCmd>>, cmd: RenderCmd| {
         if let Some(tx) = tx {
-            let _ = tx.send(cmd);
+            if let Err(err) = tx.send(cmd) {
+                tracing::warn!("failed to send render command: {err}");
+            }
         }
     };
 
@@ -1111,6 +1247,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 ref event,
                 window_id,
             } => {
+                let _tz = goldy::tracy_zone!("velato.ui_window_event");
                 let Some(win) = &window else { return };
                 if win.id() != window_id {
                     return;
@@ -1237,6 +1374,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 }
             }
             Event::AboutToWait => {
+                let _tz = goldy::tracy_zone!("velato.ui_about_to_wait");
                 touch_state.end_frame();
                 if let Some(touch_info) = touch_state.info() {
                     let centre = Vec2::new(touch_info.zoom_centre.x, touch_info.zoom_centre.y);
@@ -1277,6 +1415,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 }
             }
             Event::Resumed => {
+                let _tz = goldy::tracy_zone!("velato.ui_resumed");
                 let win = create_ekrano_window(event_loop);
                 let initial_mode = if vsync {
                     PresentMode::Fifo
@@ -1294,14 +1433,16 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 .expect("Failed to create goldy surface");
                 send_cmd(&cmd_tx, RenderCmd::SurfaceCreated(surf));
                 window = Some(win);
-                event_loop.set_control_flow(ControlFlow::Poll);
+                event_loop.set_control_flow(ControlFlow::Wait);
             }
             Event::Suspended => {
+                let _tz = goldy::tracy_zone!("velato.ui_suspended");
                 send_cmd(&cmd_tx, RenderCmd::SurfaceDropped);
                 window = None;
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             Event::LoopExiting => {
+                let _tz = goldy::tracy_zone!("velato.ui_loop_exiting");
                 cmd_tx.take();
                 window = None;
             }
