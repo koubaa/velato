@@ -64,15 +64,15 @@ pub struct SceneConfig {
 }
 
 pub struct ExampleScene {
-    pub function: Box<dyn TestScene>,
+    pub function: Box<dyn TestScene + Send>,
     pub config: SceneConfig,
 }
 
-pub trait TestScene {
+pub trait TestScene: Send {
     fn render(&mut self, scene: &mut Scene, params: &mut SceneParams<'_>);
 }
 
-impl<F: FnMut(&mut Scene, &mut SceneParams<'_>)> TestScene for F {
+impl<F: FnMut(&mut Scene, &mut SceneParams<'_>) + Send> TestScene for F {
     fn render(&mut self, scene: &mut Scene, params: &mut SceneParams<'_>) {
         self(scene, params);
     }

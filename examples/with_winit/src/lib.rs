@@ -17,8 +17,9 @@
     clippy::allow_attributes_without_reason
 )]
 
-use instant::Instant;
+#[cfg(feature = "use_vello")]
 use std::collections::HashSet;
+use instant::Instant;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -682,9 +683,348 @@ fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()
 }
 
 #[cfg(feature = "use_ekrano")]
-fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
-    use ekrano::{GoldyRenderer, RenderParams};
+enum RenderCmd {
+    SurfaceCreated(goldy::Surface),
+    SurfaceDropped,
+    TransformSet(Affine),
+    SceneDelta(i32),
+    ComplexityDelta(i32),
+    ToggleStats,
+    ClearStats,
+    ToggleVsync,
+    Resize(u32, u32),
+    Shutdown,
+}
+
+#[cfg(feature = "use_ekrano")]
+struct InputState {
+    transform: Affine,
+    scene_ix: i32,
+    complexity: usize,
+    stats_shown: bool,
+    vsync: bool,
+    width: u32,
+    height: u32,
+    start: Instant,
+}
+
+#[cfg(feature = "use_ekrano")]
+fn is_device_lost_error(err: &impl std::fmt::Display) -> bool {
+    let s = err.to_string();
+    s.contains("0x887A0005")
+        || s.contains("DEVICE_REMOVED")
+        || s.contains("device removed")
+        || s.contains("DEVICE_LOST")
+        || s.contains("device lost")
+        || s.contains("Failed to wait for frame fence")
+        || s.contains("GPU device is lost")
+}
+
+#[cfg(feature = "use_ekrano")]
+fn apply_render_cmd(
+    cmd: RenderCmd,
+    surface: &mut Option<goldy::Surface>,
+    input: &mut InputState,
+    stats: &Arc<std::sync::Mutex<stats::Stats>>,
+) -> bool {
+    use goldy::PresentMode;
+
+    match cmd {
+        RenderCmd::TransformSet(transform) => input.transform = transform,
+        RenderCmd::SceneDelta(delta) => input.scene_ix = input.scene_ix.saturating_add(delta),
+        RenderCmd::ComplexityDelta(delta) => {
+            if delta >= 0 {
+                input.complexity = input.complexity.saturating_add(delta as usize);
+            } else {
+                input.complexity = input
+                    .complexity
+                    .saturating_sub((-delta) as usize);
+            }
+        }
+        RenderCmd::ToggleStats => input.stats_shown = !input.stats_shown,
+        RenderCmd::ClearStats => {
+            if let Ok(mut stats) = stats.lock() {
+                stats.clear_min_and_max();
+            }
+        }
+        RenderCmd::ToggleVsync => {
+            input.vsync = !input.vsync;
+            let Some(surface) = surface.as_mut() else {
+                return true;
+            };
+            let mode = if input.vsync {
+                PresentMode::Fifo
+            } else {
+                PresentMode::Immediate
+            };
+            match surface.set_present_mode(mode) {
+                Ok(()) => eprintln!(
+                    "Vsync: {} (present mode: {:?})",
+                    if input.vsync { "ON" } else { "OFF" },
+                    mode
+                ),
+                Err(e) => eprintln!("Failed to set present mode: {e}"),
+            }
+        }
+        RenderCmd::Resize(width, height) => {
+            let width = width.max(1);
+            let height = height.max(1);
+            if let Some(surface) = surface.as_mut() {
+                let _ = surface.resize(width, height);
+            }
+            input.width = width;
+            input.height = height;
+        }
+        RenderCmd::SurfaceCreated(new_surface) => {
+            let (width, height) = new_surface.size();
+            input.width = width;
+            input.height = height;
+            *surface = Some(new_surface);
+        }
+        RenderCmd::SurfaceDropped => *surface = None,
+        RenderCmd::Shutdown => return false,
+    }
+    true
+}
+
+#[cfg(feature = "use_ekrano")]
+fn drain_commands(
+    cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
+    surface: &mut Option<goldy::Surface>,
+    input: &mut InputState,
+    stats: &Arc<std::sync::Mutex<stats::Stats>>,
+) -> bool {
+    loop {
+        match cmd_rx.try_recv() {
+            Ok(cmd) => {
+                if !apply_render_cmd(cmd, surface, input, stats) {
+                    return false;
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+        }
+    }
+}
+
+#[cfg(feature = "use_ekrano")]
+fn build_ekrano_scene(
+    scene: &mut ekrano::Scene,
+    fragment: &mut ekrano::Scene,
+    scenes: &mut SceneSet,
+    input: &InputState,
+    simple_text: &mut RobotoText,
+    stats: &stats::Stats,
+    base_color: Option<Color>,
+) -> ekrano::RenderParams {
+    use ekrano::RenderParams;
+
+    let scene_ix = input.scene_ix.rem_euclid(scenes.scenes.len() as i32);
+    let example_scene = &mut scenes.scenes[scene_ix as usize];
+    fragment.reset();
+    let mut scene_params = SceneParams {
+        time: input.start.elapsed().as_secs_f64(),
+        text: simple_text,
+        resolution: None,
+        base_color: None,
+        interactive: true,
+        complexity: input.complexity,
+    };
+    example_scene
+        .function
+        .render(fragment, &mut scene_params);
+
+    let resolved_base_color = base_color
+        .or(scene_params.base_color)
+        .unwrap_or(Color::BLACK);
+    let render_params = RenderParams {
+        base_color: resolved_base_color,
+        width: input.width,
+        height: input.height,
+        antialiasing_method: ekrano::AaConfig::Area,
+        robust: false,
+    };
+
+    let mut transform = input.transform;
+    if let Some(resolution) = scene_params.resolution {
+        let factor = Vec2::new(input.width as f64, input.height as f64);
+        let scale_factor = (factor.x / resolution.x).min(factor.y / resolution.y);
+        transform *= Affine::scale(scale_factor);
+    }
+
+    scene.reset();
+    scene.append(fragment, Some(transform));
+    if input.stats_shown {
+        stats.snapshot().draw_layer(
+            scene,
+            simple_text,
+            input.width as f64,
+            input.height as f64,
+            stats.samples(),
+            None,
+            input.vsync,
+            ekrano::AaConfig::Area,
+        );
+    }
+
+    render_params
+}
+
+#[cfg(feature = "use_ekrano")]
+fn ekrano_render_thread(
+    device: goldy::Device,
+    mut renderer: ekrano::GoldyRenderer,
+    mut scenes: SceneSet,
+    cmd_rx: std::sync::mpsc::Receiver<RenderCmd>,
+    base_color: Option<Color>,
+    stats: Arc<std::sync::Mutex<stats::Stats>>,
+    device_lost: Arc<std::sync::atomic::AtomicBool>,
+    initial_scene_ix: i32,
+    initial_vsync: bool,
+) {
+    use ekrano::PreparedFrame;
+
+    let start = Instant::now();
+    let mut surface: Option<goldy::Surface> = None;
+    let mut input = InputState {
+        transform: Affine::IDENTITY,
+        scene_ix: initial_scene_ix,
+        complexity: 0,
+        stats_shown: true,
+        vsync: initial_vsync,
+        width: 0,
+        height: 0,
+        start,
+    };
+    let mut prev_scene_ix = input.scene_ix - 1;
+    let mut stash: Option<PreparedFrame> = None;
+    let mut scene = Scene::new();
+    let mut fragment = Scene::new();
+    let mut simple_text = RobotoText::new();
+    let mut frame_start_time = Instant::now();
+
+    loop {
+        while surface.is_none() {
+            match cmd_rx.recv() {
+                Ok(cmd) => {
+                    if !apply_render_cmd(cmd, &mut surface, &mut input, &stats) {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+
+        if !drain_commands(&cmd_rx, &mut surface, &mut input, &stats) {
+            break;
+        }
+
+        let Some(surface_ref) = surface.as_ref() else {
+            continue;
+        };
+        if input.width == 0 || input.height == 0 {
+            continue;
+        }
+
+        let scene_ix = input.scene_ix.rem_euclid(scenes.scenes.len() as i32);
+        if prev_scene_ix != scene_ix {
+            input.transform = Affine::IDENTITY;
+            prev_scene_ix = scene_ix;
+        }
+
+        let render_params = {
+            let stats_guard = stats.lock().expect("stats mutex poisoned");
+            build_ekrano_scene(
+                &mut scene,
+                &mut fragment,
+                &mut scenes,
+                &input,
+                &mut simple_text,
+                &stats_guard,
+                base_color,
+            )
+        };
+
+        let prepared = match stash.take() {
+            Some(prepared)
+                if prepared.width() == input.width && prepared.height() == input.height =>
+            {
+                prepared
+            }
+            _ => match renderer.prepare(&scene, &render_params) {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    eprintln!("Prepare error: {e}");
+                    if is_device_lost_error(&e) {
+                        device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    continue;
+                }
+            },
+        };
+
+        let submit_result = renderer.submit_prepared(&device, prepared, surface_ref);
+        let (frame_stats, frame) = match submit_result {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("submit_prepared error: {e}");
+                if is_device_lost_error(&e) {
+                    device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                continue;
+            }
+        };
+
+        if frame_stats.bump_retries > 0 {
+            eprintln!(
+                "[BUMP] bump allocator reallocated {} time(s) this frame",
+                frame_stats.bump_retries,
+            );
+        }
+
+        {
+            let stats_guard = stats.lock().expect("stats mutex poisoned");
+            let overlap_params = build_ekrano_scene(
+                &mut scene,
+                &mut fragment,
+                &mut scenes,
+                &input,
+                &mut simple_text,
+                &stats_guard,
+                base_color,
+            );
+            stash = renderer.prepare(&scene, &overlap_params).ok();
+        }
+
+        if let Err(e) = frame.present() {
+            eprintln!("present error: {e}");
+            if is_device_lost_error(&e) {
+                device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
+            continue;
+        }
+
+        let new_time = Instant::now();
+        stats
+            .lock()
+            .expect("stats mutex poisoned")
+            .add_sample(stats::Sample {
+                frame_time_us: (new_time - frame_start_time).as_micros() as u64,
+            });
+        frame_start_time = new_time;
+    }
+}
+
+#[cfg(feature = "use_ekrano")]
+fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
+    use ekrano::GoldyRenderer;
     use goldy::{DeviceType, Instance, PresentMode, Surface, SurfaceConfig};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, Sender};
+    use std::sync::{Arc, Mutex};
     use winit::event::*;
     use winit::event_loop::ControlFlow;
     use winit::keyboard::*;
@@ -711,41 +1051,59 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
         .or_else(|_| instance.create_device(DeviceType::IntegratedGpu))
         .or_else(|_| instance.create_device(DeviceType::Other))
         .expect("No GPU device found");
+    let device_ui = device.clone();
 
     let start_create = Instant::now();
-    let mut renderer = GoldyRenderer::new(&device).expect("Failed to create ekrano renderer");
+    let renderer = GoldyRenderer::new(&device).expect("Failed to create ekrano renderer");
     eprintln!("Creating ekrano renderer took {:?}", start_create.elapsed());
 
-    let mut window: Option<Arc<Window>> = None;
-    let mut surface: Option<Surface> = None;
-    let mut vsync = !args.no_vsync;
+    let vsync = !args.no_vsync;
+    let initial_scene_ix = args.scene.unwrap_or(0);
+    let base_color = args.args.base_color;
+    let scene_names: Vec<String> = scenes
+        .scenes
+        .iter()
+        .map(|scene| scene.config.name.clone())
+        .collect();
     let auto_exit_deadline = args
         .timeout_secs
         .map(|s| Instant::now() + std::time::Duration::from_secs(s));
 
-    let mut scene = Scene::new();
-    let mut fragment = Scene::new();
-    let mut simple_text = RobotoText::new();
-    let mut stats = stats::Stats::new();
-    let mut stats_shown = true;
+    let stats = Arc::new(Mutex::new(stats::Stats::new()));
+    let device_lost = Arc::new(AtomicBool::new(false));
+    let (cmd_tx, cmd_rx) = mpsc::channel::<RenderCmd>();
 
-    let mut frame_start_time = Instant::now();
-    let start = Instant::now();
+    let render_stats = Arc::clone(&stats);
+    let render_device_lost = Arc::clone(&device_lost);
+    let bench_stats = Arc::clone(&stats);
+    let render_thread = std::thread::spawn(move || {
+        ekrano_render_thread(
+            device,
+            renderer,
+            scenes,
+            cmd_rx,
+            base_color,
+            render_stats,
+            render_device_lost,
+            initial_scene_ix,
+            vsync,
+        );
+    });
 
+    let mut window: Option<Arc<Window>> = None;
+    let mut cmd_tx: Option<Sender<RenderCmd>> = Some(cmd_tx);
     let mut touch_state = multi_touch::TouchState::new();
-    let _navigation_fingers: HashSet<u64> = HashSet::new();
     let mut transform = Affine::IDENTITY;
     let mut mouse_down = false;
     let mut prior_position: Option<Vec2> = None;
-    let mut _modifiers = winit::keyboard::ModifiersState::default();
-    let mut device_lost = false;
-    let mut scene_ix: i32 = 0;
-    let mut complexity: usize = 0;
-    let mut complexity_shown = false;
-    if let Some(set_scene) = args.scene {
-        scene_ix = set_scene;
-    }
+    let mut scene_ix = initial_scene_ix;
     let mut prev_scene_ix = scene_ix - 1;
+
+    let send_cmd = |tx: &Option<Sender<RenderCmd>>, cmd: RenderCmd| {
+        if let Some(tx) = tx {
+            let _ = tx.send(cmd);
+        }
+    };
 
     event_loop
         .run(move |event, event_loop| match event {
@@ -759,28 +1117,33 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                 }
                 match event {
                     WindowEvent::CloseRequested => {
+                        send_cmd(&cmd_tx, RenderCmd::Shutdown);
                         event_loop.exit();
                     }
-                    WindowEvent::ModifiersChanged(m) => {
-                        _modifiers = m.state();
-                    }
+                    WindowEvent::ModifiersChanged(_) => {}
                     WindowEvent::KeyboardInput { event, .. } => {
                         if event.state == ElementState::Pressed {
                             match event.logical_key.as_ref() {
                                 Key::Named(NamedKey::ArrowLeft) => {
                                     scene_ix = scene_ix.saturating_sub(1);
+                                    send_cmd(&cmd_tx, RenderCmd::SceneDelta(-1));
                                 }
                                 Key::Named(NamedKey::ArrowRight) => {
                                     scene_ix = scene_ix.saturating_add(1);
+                                    send_cmd(&cmd_tx, RenderCmd::SceneDelta(1));
                                 }
-                                Key::Named(NamedKey::ArrowUp) => complexity += 1,
+                                Key::Named(NamedKey::ArrowUp) => {
+                                    send_cmd(&cmd_tx, RenderCmd::ComplexityDelta(1));
+                                }
                                 Key::Named(NamedKey::ArrowDown) => {
-                                    complexity = complexity.saturating_sub(1);
+                                    send_cmd(&cmd_tx, RenderCmd::ComplexityDelta(-1));
                                 }
                                 Key::Named(NamedKey::Space) => {
                                     transform = Affine::IDENTITY;
+                                    send_cmd(&cmd_tx, RenderCmd::TransformSet(transform));
                                 }
                                 Key::Named(NamedKey::Escape) => {
+                                    send_cmd(&cmd_tx, RenderCmd::Shutdown);
                                     event_loop.exit();
                                 }
                                 Key::Character(char) => {
@@ -794,38 +1157,29 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                                                     * Affine::rotate(angle)
                                                     * Affine::translate(-prior_position)
                                                     * transform;
+                                                send_cmd(&cmd_tx, RenderCmd::TransformSet(transform));
                                             }
                                         }
-                                        "s" => stats_shown = !stats_shown,
-                                        "c" => stats.clear_min_and_max(),
-                                        "d" => complexity_shown = !complexity_shown,
+                                        "s" => send_cmd(&cmd_tx, RenderCmd::ToggleStats),
+                                        "c" => {
+                                            send_cmd(&cmd_tx, RenderCmd::ClearStats);
+                                            if let Ok(mut stats) = stats.lock() {
+                                                stats.clear_min_and_max();
+                                            }
+                                        }
+                                        "d" => {
+                                            eprintln!(
+                                                "Complexity overlay toggling not available in ekrano mode"
+                                            );
+                                        }
                                         "m" => {
                                             eprintln!(
                                                 "AA method switching not available in ekrano mode"
                                             );
                                         }
                                         "v" => {
-                                            // Ignore auto-repeat to avoid flipping vsync hundreds of
-                                            // times a second when the user holds the key.
-                                            if event.repeat {
-                                                // no-op
-                                            } else if let Some(surf) = surface.as_mut() {
-                                                vsync = !vsync;
-                                                let mode = if vsync {
-                                                    PresentMode::Fifo
-                                                } else {
-                                                    PresentMode::Immediate
-                                                };
-                                                match surf.set_present_mode(mode) {
-                                                    Ok(()) => eprintln!(
-                                                        "Vsync: {} (present mode: {:?})",
-                                                        if vsync { "ON" } else { "OFF" },
-                                                        mode
-                                                    ),
-                                                    Err(e) => {
-                                                        eprintln!("Failed to set present mode: {e}")
-                                                    }
-                                                }
+                                            if !event.repeat {
+                                                send_cmd(&cmd_tx, RenderCmd::ToggleVsync);
                                             }
                                         }
                                         _ => {}
@@ -836,12 +1190,10 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                         }
                     }
                     WindowEvent::Resized(size) => {
-                        if let Some(surf) = &mut surface {
-                            let _ = surf.resize(size.width.max(1), size.height.max(1));
-                        }
-                        if let Some(win) = &window {
-                            win.request_redraw();
-                        }
+                        send_cmd(
+                            &cmd_tx,
+                            RenderCmd::Resize(size.width.max(1), size.height.max(1)),
+                        );
                     }
                     WindowEvent::MouseInput { state, button, .. } => {
                         if button == &MouseButton::Left {
@@ -863,6 +1215,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                                 * Affine::scale(BASE.powf(exponent))
                                 * Affine::translate(-prior_position)
                                 * transform;
+                            send_cmd(&cmd_tx, RenderCmd::TransformSet(transform));
                         }
                     }
                     WindowEvent::Touch(touch) => {
@@ -875,130 +1228,17 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                         let position = Vec2::new(position.x, position.y);
                         if mouse_down && let Some(prior) = prior_position {
                             transform = Affine::translate(position - prior) * transform;
+                            send_cmd(&cmd_tx, RenderCmd::TransformSet(transform));
                         }
                         prior_position = Some(position);
                     }
-                    WindowEvent::RedrawRequested => {
-                        if device_lost {
-                            return;
-                        }
-                        let Some(win) = &window else { return };
-                        let Some(surf) = surface.as_mut() else { return };
-                        let (width, height) = surf.size();
-                        if width == 0 || height == 0 {
-                            return;
-                        }
-                        let snapshot = stats.snapshot();
-
-                        scene_ix = scene_ix.rem_euclid(scenes.scenes.len() as i32);
-                        let example_scene = &mut scenes.scenes[scene_ix as usize];
-                        if prev_scene_ix != scene_ix {
-                            transform = Affine::IDENTITY;
-                            prev_scene_ix = scene_ix;
-                            win.set_title(&format!("Ekrano demo - {}", example_scene.config.name));
-                        }
-                        fragment.reset();
-                        let mut scene_params = SceneParams {
-                            time: start.elapsed().as_secs_f64(),
-                            text: &mut simple_text,
-                            resolution: None,
-                            base_color: None,
-                            interactive: true,
-                            complexity,
-                        };
-                        example_scene
-                            .function
-                            .render(&mut fragment, &mut scene_params);
-
-                        let base_color = args
-                            .args
-                            .base_color
-                            .or(scene_params.base_color)
-                            .unwrap_or(Color::BLACK);
-                        let render_params = RenderParams {
-                            base_color,
-                            width,
-                            height,
-                            antialiasing_method: ekrano::AaConfig::Area,
-                            robust: false,
-                        };
-                        scene.reset();
-                        let mut transform = transform;
-                        if let Some(resolution) = scene_params.resolution {
-                            let factor = Vec2::new(width as f64, height as f64);
-                            let scale_factor =
-                                (factor.x / resolution.x).min(factor.y / resolution.y);
-                            transform *= Affine::scale(scale_factor);
-                        }
-                        scene.append(&fragment, Some(transform));
-                        if stats_shown {
-                            snapshot.draw_layer(
-                                &mut scene,
-                                &mut simple_text,
-                                width as f64,
-                                height as f64,
-                                stats.samples(),
-                                None,
-                                vsync,
-                                ekrano::AaConfig::Area,
-                            );
-                        }
-
-                        let render_result =
-                            renderer.render_to_surface(&device, &scene, surf, &render_params);
-                        match render_result {
-                            Err(ref e) => {
-                                let s = e.to_string();
-                                if s.contains("0x887A0005")
-                                    || s.contains("DEVICE_REMOVED")
-                                    || s.contains("device removed")
-                                    || s.contains("DEVICE_LOST")
-                                    || s.contains("device lost")
-                                    || s.contains("Failed to wait for frame fence")
-                                {
-                                    eprintln!("render_to_surface device lost: {e}");
-                                    device_lost = true;
-                                    event_loop.exit();
-                                    return;
-                                }
-                            }
-                            _ => {}
-                        }
-                        match render_result {
-                            Ok(stats) if stats.bump_retries > 0 => {
-                                eprintln!(
-                                    "[BUMP] bump allocator reallocated {} time(s) this frame",
-                                    stats.bump_retries,
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                eprintln!("Render error: {e}");
-                                // `GPU device is lost` means a prior wait_fence timed out
-                                // and the device is permanently wedged. Every subsequent
-                                // frame will fail the same way; exit so the user isn't
-                                // flooded with identical errors.
-                                if e.to_string().contains("GPU device is lost") {
-                                    eprintln!("GPU is wedged — exiting");
-                                    event_loop.exit();
-                                }
-                                return;
-                            }
-                        }
-
-                        let new_time = Instant::now();
-                        stats.add_sample(stats::Sample {
-                            frame_time_us: (new_time - frame_start_time).as_micros() as u64,
-                        });
-                        frame_start_time = new_time;
-                    }
+                    WindowEvent::RedrawRequested => {}
                     _ => {}
                 }
             }
             Event::AboutToWait => {
                 touch_state.end_frame();
-                let touch_info = touch_state.info();
-                if let Some(touch_info) = touch_info {
+                if let Some(touch_info) = touch_state.info() {
                     let centre = Vec2::new(touch_info.zoom_centre.x, touch_info.zoom_centre.y);
                     transform = Affine::translate(touch_info.translation_delta)
                         * Affine::translate(centre)
@@ -1006,15 +1246,34 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                         * Affine::rotate(touch_info.rotation_delta)
                         * Affine::translate(-centre)
                         * transform;
+                    send_cmd(&cmd_tx, RenderCmd::TransformSet(transform));
+                }
+                if device_lost.load(Ordering::Relaxed) {
+                    eprintln!("GPU device lost — exiting");
+                    send_cmd(&cmd_tx, RenderCmd::Shutdown);
+                    event_loop.exit();
+                    return;
                 }
                 if let Some(deadline) = auto_exit_deadline {
                     if Instant::now() >= deadline {
+                        send_cmd(&cmd_tx, RenderCmd::Shutdown);
                         event_loop.exit();
                         return;
                     }
                 }
                 if let Some(win) = &window {
-                    win.request_redraw();
+                    let scene_count = scene_names.len().max(1) as i32;
+                    scene_ix = scene_ix.rem_euclid(scene_count);
+                    if prev_scene_ix != scene_ix {
+                        prev_scene_ix = scene_ix;
+                        transform = Affine::IDENTITY;
+                        send_cmd(&cmd_tx, RenderCmd::TransformSet(transform));
+                        let title = scene_names
+                            .get(scene_ix as usize)
+                            .map(|name| format!("Ekrano demo - {name}"))
+                            .unwrap_or_else(|| "Ekrano demo".to_string());
+                        win.set_title(&title);
+                    }
                 }
             }
             Event::Resumed => {
@@ -1025,7 +1284,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                     PresentMode::Immediate
                 };
                 let surf = Surface::new_with_config(
-                    &device,
+                    &device_ui,
                     win.as_ref(),
                     SurfaceConfig {
                         present_mode: initial_mode,
@@ -1033,35 +1292,33 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, mut scenes: SceneSet) {
                     },
                 )
                 .expect("Failed to create goldy surface");
+                send_cmd(&cmd_tx, RenderCmd::SurfaceCreated(surf));
                 window = Some(win);
-                surface = Some(surf);
                 event_loop.set_control_flow(ControlFlow::Poll);
             }
             Event::Suspended => {
-                surface = None;
+                send_cmd(&cmd_tx, RenderCmd::SurfaceDropped);
                 window = None;
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             Event::LoopExiting => {
-                let snap = stats.snapshot();
-                eprintln!(
-                    "[bench] fps={:.1} frame_ms={:.3} min_ms={:.3} max_ms={:.3}",
-                    snap.fps, snap.frame_time_ms, snap.frame_time_min_ms, snap.frame_time_max_ms
-                );
-                // Always drop the surface and window here — before the event-loop
-                // closure itself is dropped — so that Surface::drop runs its
-                // backend.destroy_surface() call while the device handle is still
-                // live in the backend's state map.  Without this, the Rust drop
-                // order inside the closure is unspecified relative to the device,
-                // and the Vulkan validation layer reports undestroyed child objects
-                // (VkDescriptorPool, VkCommandPool) at vkDestroyDevice time
-                // (VUID-vkDestroyDevice-device-05137).
-                surface = None;
+                cmd_tx.take();
                 window = None;
             }
             _ => {}
         })
         .expect("run to completion");
+
+    let _ = render_thread.join();
+
+    let snap = bench_stats
+        .lock()
+        .expect("stats mutex poisoned")
+        .snapshot();
+    eprintln!(
+        "[bench] fps={:.1} frame_ms={:.3} min_ms={:.3} max_ms={:.3}",
+        snap.fps, snap.frame_time_ms, snap.frame_time_min_ms, snap.frame_time_max_ms
+    );
 }
 
 /// # Panics
