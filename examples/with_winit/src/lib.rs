@@ -971,6 +971,178 @@ impl Presenter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Render-thread helpers
+// ---------------------------------------------------------------------------
+
+/// Outcome of a single-frame rendering step.
+///
+/// Returned by helpers that can fail in two distinct ways, letting the main
+/// render loop stay readable without inline `break`/`continue` branches.
+#[cfg(feature = "use_ekrano")]
+enum RenderStep<T> {
+    /// Step produced a value; processing continues normally.
+    Ok(T),
+    /// Transient failure (e.g. prepare error); skip this frame and retry.
+    SkipFrame,
+    /// Fatal condition (device lost or channel closed); exit the render loop.
+    Shutdown,
+}
+
+/// Blocks the render thread until a [`goldy::Surface`] is available, processing
+/// any incoming [`RenderCmd`]s in the meantime.
+///
+/// Returns `false` if the thread should exit entirely (channel disconnected or
+/// `Shutdown` command received).
+#[cfg(feature = "use_ekrano")]
+fn block_until_surface(
+    cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
+    surface: &mut Option<goldy::Surface>,
+    input: &mut InputState,
+    stats: &Arc<std::sync::Mutex<stats::Stats>>,
+) -> bool {
+    while surface.is_none() {
+        let _tz = goldy::tracy_zone!("velato.wait_surface");
+        match cmd_rx.recv() {
+            Ok(cmd) => {
+                if !apply_render_cmd(cmd, surface, input, stats) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Waits for `TID_PRESENT` to acknowledge the previous frame, then drains
+/// any pending UI commands.
+///
+/// **Ordering guarantee:** `wait_for_present_ack` must complete before
+/// `drain_commands` because draining can call `surface.resize()` (and other
+/// surface-mutating operations). Both `resize` and `present_frame` lock the
+/// same backend mutex, so whichever wins first determines the outcome.
+/// Draining first would let a `Resize` command clear `current_image_index`
+/// before `TID_PRESENT` reads it, producing "No image to present".
+///
+/// Returns `false` if the render loop should exit.
+#[cfg(feature = "use_ekrano")]
+fn sync_present_and_drain(
+    present_in_flight: &mut bool,
+    presenter: &Presenter,
+    cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
+    surface: &mut Option<goldy::Surface>,
+    input: &mut InputState,
+    stats: &Arc<std::sync::Mutex<stats::Stats>>,
+) -> bool {
+    if *present_in_flight {
+        let _tz = goldy::tracy_zone!("velato.wait_present_ack");
+        if !presenter.wait_for_present_ack() {
+            return false;
+        }
+        *present_in_flight = false;
+    }
+    drain_commands(cmd_rx, surface, input, stats)
+}
+
+/// Returns the stashed `PreparedFrame` when its dimensions still match the
+/// current viewport, or encodes and uploads the scene from scratch.
+///
+/// Returns [`RenderStep::SkipFrame`] on a transient prepare error and
+/// [`RenderStep::Shutdown`] on device loss.
+#[cfg(feature = "use_ekrano")]
+fn take_stash_or_rebuild(
+    stash: Option<ekrano::PreparedFrame>,
+    renderer: &mut ekrano::GoldyRenderer,
+    scene: &mut ekrano::Scene,
+    fragment: &mut ekrano::Scene,
+    scenes: &mut SceneSet,
+    input: &InputState,
+    simple_text: &mut RobotoText,
+    stats: &Arc<std::sync::Mutex<stats::Stats>>,
+    base_color: Option<Color>,
+    device_lost: &std::sync::atomic::AtomicBool,
+) -> RenderStep<ekrano::PreparedFrame> {
+    if let Some(prepared) = stash {
+        if prepared.width() == input.width && prepared.height() == input.height {
+            return RenderStep::Ok(prepared);
+        }
+    }
+    let render_params = {
+        let _tz = goldy::tracy_zone!("velato.build_scene_fallback");
+        let stats_guard = stats.lock().expect("stats mutex poisoned");
+        build_ekrano_scene(scene, fragment, scenes, input, simple_text, &stats_guard, base_color)
+    };
+    match renderer.prepare(scene, &render_params) {
+        Ok(prepared) => RenderStep::Ok(prepared),
+        Err(e) => {
+            eprintln!("Prepare error: {e}");
+            if is_device_lost_error(&e) {
+                device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                RenderStep::Shutdown
+            } else {
+                RenderStep::SkipFrame
+            }
+        }
+    }
+}
+
+/// Submits a [`PreparedFrame`] to the GPU surface and returns the resulting
+/// [`goldy::Frame`] ready to hand off to `TID_PRESENT`.
+///
+/// Returns [`RenderStep::SkipFrame`] on a transient error and
+/// [`RenderStep::Shutdown`] on device loss.
+#[cfg(feature = "use_ekrano")]
+fn try_submit_prepared(
+    renderer: &mut ekrano::GoldyRenderer,
+    device: &goldy::Device,
+    prepared: ekrano::PreparedFrame,
+    surface: &goldy::Surface,
+    device_lost: &std::sync::atomic::AtomicBool,
+) -> RenderStep<(ekrano::FrameStats, goldy::Frame)> {
+    match renderer.submit_prepared(device, prepared, surface) {
+        Ok(result) => RenderStep::Ok(result),
+        Err(e) => {
+            eprintln!("submit_prepared error: {e}");
+            if is_device_lost_error(&e) {
+                device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                RenderStep::Shutdown
+            } else {
+                RenderStep::SkipFrame
+            }
+        }
+    }
+}
+
+/// Speculatively builds the *next* frame's `PreparedFrame` while `TID_PRESENT`
+/// is busy calling `swapchain.Present()` for the frame just submitted.
+///
+/// The result is stashed and consumed at the top of the next iteration if the
+/// viewport dimensions haven't changed; otherwise it is discarded.
+#[cfg(feature = "use_ekrano")]
+fn build_overlap_stash(
+    renderer: &mut ekrano::GoldyRenderer,
+    scene: &mut ekrano::Scene,
+    fragment: &mut ekrano::Scene,
+    scenes: &mut SceneSet,
+    input: &InputState,
+    simple_text: &mut RobotoText,
+    stats: &Arc<std::sync::Mutex<stats::Stats>>,
+    base_color: Option<Color>,
+) -> Option<ekrano::PreparedFrame> {
+    let _tz = goldy::tracy_zone!("velato.overlap_prepare");
+    let overlap_params = {
+        let _tz = goldy::tracy_zone!("velato.build_scene_overlap");
+        let stats_guard = stats.lock().expect("stats mutex poisoned");
+        build_ekrano_scene(scene, fragment, scenes, input, simple_text, &stats_guard, base_color)
+    };
+    renderer.prepare(scene, &overlap_params).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Render thread entry point
+// ---------------------------------------------------------------------------
+
 #[cfg(feature = "use_ekrano")]
 fn ekrano_render_thread(
     device: goldy::Device,
@@ -983,7 +1155,7 @@ fn ekrano_render_thread(
     initial_scene_ix: i32,
     initial_vsync: bool,
 ) {
-    use ekrano::PreparedFrame;
+    use std::sync::atomic::Ordering;
 
     let start = Instant::now();
     let mut surface: Option<goldy::Surface> = None;
@@ -998,7 +1170,7 @@ fn ekrano_render_thread(
         start,
     };
     let mut prev_scene_ix = input.scene_ix - 1;
-    let mut stash: Option<PreparedFrame> = None;
+    let mut stash: Option<ekrano::PreparedFrame> = None;
     let mut scene = Scene::new();
     let mut fragment = Scene::new();
     let mut simple_text = RobotoText::new();
@@ -1007,99 +1179,51 @@ fn ekrano_render_thread(
     let mut present_in_flight = false;
 
     loop {
-        if device_lost.load(std::sync::atomic::Ordering::Relaxed) {
+        if device_lost.load(Ordering::Relaxed) {
             break;
         }
 
-        while surface.is_none() {
-            let _tz = goldy::tracy_zone!("velato.wait_surface");
-            match cmd_rx.recv() {
-                Ok(cmd) => {
-                    if !apply_render_cmd(cmd, &mut surface, &mut input, &stats) {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
+        // Phase 1 — Sync: wait for a surface, flush the previous present, then
+        // consume any pending UI commands (resize, scene-switch, etc.).
+        if !block_until_surface(&cmd_rx, &mut surface, &mut input, &stats) {
+            return;
         }
-
-        if !drain_commands(&cmd_rx, &mut surface, &mut input, &stats) {
+        if !sync_present_and_drain(&mut present_in_flight, &presenter, &cmd_rx, &mut surface, &mut input, &stats) {
             break;
         }
 
-        let Some(surface_ref) = surface.as_ref() else {
-            continue;
-        };
+        let Some(surface_ref) = surface.as_ref() else { continue };
         if input.width == 0 || input.height == 0 {
             continue;
         }
 
         let _frame = goldy::tracy_zone!("velato.render_frame");
 
+        // Reset the view transform when the user switches scenes.
         let scene_ix = input.scene_ix.rem_euclid(scenes.scenes.len() as i32);
         if prev_scene_ix != scene_ix {
             input.transform = Affine::IDENTITY;
             prev_scene_ix = scene_ix;
         }
 
-        let prepared = match stash.take() {
-            Some(prepared)
-                if prepared.width() == input.width && prepared.height() == input.height =>
-            {
-                prepared
-            }
-            _ => {
-                let render_params = {
-                    let _tz = goldy::tracy_zone!("velato.build_scene_fallback");
-                    let stats_guard = stats.lock().expect("stats mutex poisoned");
-                    build_ekrano_scene(
-                        &mut scene,
-                        &mut fragment,
-                        &mut scenes,
-                        &input,
-                        &mut simple_text,
-                        &stats_guard,
-                        base_color,
-                    )
-                };
-                match renderer.prepare(&scene, &render_params) {
-                    Ok(prepared) => prepared,
-                    Err(e) => {
-                        eprintln!("Prepare error: {e}");
-                        if is_device_lost_error(&e) {
-                            device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
-                            break;
-                        }
-                        continue;
-                    }
-                }
-            }
+        // Phase 2 — Prepare: reuse the overlap stash or rebuild the scene.
+        let prepared = match take_stash_or_rebuild(
+            stash.take(), &mut renderer,
+            &mut scene, &mut fragment, &mut scenes,
+            &input, &mut simple_text, &stats, base_color, &device_lost,
+        ) {
+            RenderStep::Ok(p) => p,
+            RenderStep::SkipFrame => continue,
+            RenderStep::Shutdown => break,
         };
 
-        // Wait for TID_PRESENT to finish the previous present before acquiring
-        // the next swapchain image inside submit_prepared. The DX12 backend
-        // stores current_image_index as single-valued mutable state; present
-        // and acquire cannot race. ekrano.prepare() above is pure CPU and does
-        // not touch the surface, so the overlap window is maximised.
-        if present_in_flight {
-            let _tz = goldy::tracy_zone!("velato.wait_present_ack");
-            if !presenter.wait_for_present_ack() {
-                break;
-            }
-            present_in_flight = false;
-        }
-
-        let submit_result = renderer.submit_prepared(&device, prepared, surface_ref);
-        let (frame_stats, frame) = match submit_result {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("submit_prepared error: {e}");
-                if is_device_lost_error(&e) {
-                    device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
-                    break;
-                }
-                continue;
-            }
+        // Phase 3 — Submit: encode GPU commands and acquire a swapchain image.
+        let (frame_stats, frame) = match try_submit_prepared(
+            &mut renderer, &device, prepared, surface_ref, &device_lost,
+        ) {
+            RenderStep::Ok(r) => r,
+            RenderStep::SkipFrame => continue,
+            RenderStep::Shutdown => break,
         };
 
         if frame_stats.bump_retries > 0 {
@@ -1114,38 +1238,22 @@ fn ekrano_render_thread(
         }
         present_in_flight = true;
 
-        if !drain_commands(&cmd_rx, &mut surface, &mut input, &stats) {
-            break;
-        }
-
-        {
-            let _overlap = goldy::tracy_zone!("velato.overlap_prepare");
-            let overlap_params = {
-                let _tz = goldy::tracy_zone!("velato.build_scene_overlap");
-                let stats_guard = stats.lock().expect("stats mutex poisoned");
-                build_ekrano_scene(
-                    &mut scene,
-                    &mut fragment,
-                    &mut scenes,
-                    &input,
-                    &mut simple_text,
-                    &stats_guard,
-                    base_color,
-                )
-            };
-            stash = renderer.prepare(&scene, &overlap_params).ok();
-        }
+        // Phase 4 — Overlap: build the next frame's scene on the CPU while
+        // TID_PRESENT calls swapchain.Present() for the frame just submitted.
+        stash = build_overlap_stash(
+            &mut renderer,
+            &mut scene, &mut fragment, &mut scenes,
+            &input, &mut simple_text, &stats, base_color,
+        );
 
         let new_time = Instant::now();
-        {
-            let _tz = goldy::tracy_zone!("velato.record_stats");
-            stats
-                .lock()
-                .expect("stats mutex poisoned")
-                .add_sample(stats::Sample {
-                    frame_time_us: (new_time - frame_start_time).as_micros() as u64,
-                });
-        }
+        let _tz = goldy::tracy_zone!("velato.record_stats");
+        stats
+            .lock()
+            .expect("stats mutex poisoned")
+            .add_sample(stats::Sample {
+                frame_time_us: (new_time - frame_start_time).as_micros() as u64,
+            });
         frame_start_time = new_time;
     }
 
