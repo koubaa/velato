@@ -1310,7 +1310,7 @@ fn ekrano_render_thread(
 #[cfg(feature = "use_ekrano")]
 fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     use ekrano::GoldyRenderer;
-    use goldy::{DeviceType, Instance, PresentMode, Surface, SurfaceConfig};
+    use goldy::{DeviceDescriptor, Instance, PresentMode, RequestAdapterOptions, Surface, SurfaceConfig};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Sender};
     use std::sync::{Arc, Mutex};
@@ -1336,9 +1336,9 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
 
     let instance = Instance::new().expect("Failed to create Goldy instance");
     let device = instance
-        .create_device(DeviceType::DiscreteGpu)
-        .or_else(|_| instance.create_device(DeviceType::IntegratedGpu))
-        .or_else(|_| instance.create_device(DeviceType::Other))
+        .request_adapter(&RequestAdapterOptions::default())
+        .expect("No GPU adapter found")
+        .request_device(&DeviceDescriptor::default())
         .expect("No GPU device found");
     let device_ui = device.clone();
 
