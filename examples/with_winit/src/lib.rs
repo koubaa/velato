@@ -769,9 +769,10 @@ fn apply_render_cmd(
         RenderCmd::Resize(width, height) => {
             let width = width.max(1);
             let height = height.max(1);
-            if let Some(surface) = surface.as_mut() {
-                let _ = surface.resize(width, height);
-            }
+            // Do NOT call surface.resize() here. A deferred resize is applied once at the
+            // end of drain_commands (see surface_dirty flag) so that a burst of per-pixel
+            // events during a smooth window drag produces at most one swapchain rebuild —
+            // not one per event.
             input.width = width;
             input.height = height;
         }
@@ -795,17 +796,48 @@ fn drain_commands(
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
 ) -> bool {
     let _tz = goldy::tracy_zone!("velato.drain_commands");
+    // Set when a command that can change surface dimensions or present mode is drained.
+    // The deferred resize at the bottom fires exactly once when this is true, batching
+    // any burst of per-pixel Resize events from a smooth window drag into a single
+    // swapchain rebuild (one device_wait_idle) instead of one per event.
+    //
+    // Backend notes:
+    //   Vulkan  — the rebuild here may be followed by a present failure on the very
+    //             next frame if the window kept moving during device_wait_idle. That is
+    //             handled by the reactive SkipFrame path in the render loop which then
+    //             rebuilds to the latest dimensions. Present failures are debug-level
+    //             only (see goldy queue_present logging) so this is not user-visible.
+    //   DX12    — DXGI has no "out-of-date" signal; without the proactive rebuild here
+    //             the swapchain would silently stretch for the life of the drag gesture.
+    //   Metal   — CAMetalLayer reads drawableSize on every acquire and self-corrects,
+    //             so the rebuild here is a no-op if the layer already resized itself.
+    let mut surface_dirty = false;
     loop {
         match cmd_rx.try_recv() {
             Ok(cmd) => {
+                surface_dirty |=
+                    matches!(cmd, RenderCmd::Resize(..) | RenderCmd::ToggleVsync);
                 if !apply_render_cmd(cmd, surface, input, stats) {
                     return false;
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
         }
     }
+
+    if surface_dirty {
+        // A present-mode change (ToggleVsync) requires an immediate swapchain rebuild before
+        // the next frame. The surface may clamp the requested dimensions to its capability
+        // limits (Surface::resize reads back the backend's actual extent), so sync
+        // input.width/height to the real swapchain afterwards.
+        if let Some(s) = surface.as_mut() {
+            let _ = s.resize(input.width, input.height);
+            input.width = s.width();
+            input.height = s.height();
+        }
+    }
+    true
 }
 
 #[cfg(feature = "use_ekrano")]
@@ -1222,7 +1254,22 @@ fn ekrano_render_thread(
             &mut renderer, &device, prepared, surface_ref, &device_lost,
         ) {
             RenderStep::Ok(r) => r,
-            RenderStep::SkipFrame => continue,
+            RenderStep::SkipFrame => {
+                // Swapchain is out of date (ERROR_OUT_OF_DATE_KHR from acquire_next_image).
+                // Rebuild it reactively at the latest requested dimensions. Doing this here
+                // — rather than proactively in drain_commands — prevents the cascade of
+                // consecutive present failures caused by rebuilding before Vulkan says it
+                // is needed: that triggered device_wait_idle, during which the window moved
+                // further, making each new swapchain immediately stale.
+                if let Some(s) = surface.as_mut() {
+                    let _ = s.resize(input.width, input.height);
+                    // Sync input so the next frame uses the actual swapchain dimensions
+                    // (may differ from requested due to Vulkan capability clamping).
+                    input.width = s.width();
+                    input.height = s.height();
+                }
+                continue
+            }
             RenderStep::Shutdown => break,
         };
 
