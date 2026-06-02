@@ -37,9 +37,6 @@ use vello::util::{RenderContext, RenderSurface};
 #[cfg(feature = "use_vello")]
 use vello::{AaConfig, Renderer, RendererOptions, Scene, wgpu};
 
-#[cfg(feature = "use_ekrano")]
-use ekrano::Scene;
-
 use winit::event_loop::{EventLoop, EventLoopBuilder};
 use winit::window::Window;
 
@@ -1203,8 +1200,8 @@ fn ekrano_render_thread(
     };
     let mut prev_scene_ix = input.scene_ix - 1;
     let mut stash: Option<ekrano::PreparedFrame> = None;
-    let mut scene = Scene::new();
-    let mut fragment = Scene::new();
+    let mut scene = ekrano::Scene::new();
+    let mut fragment = ekrano::Scene::new();
     let mut simple_text = RobotoText::new();
     let mut frame_start_time = Instant::now();
     let presenter = Presenter::new(Arc::clone(&device_lost));
@@ -1310,7 +1307,9 @@ fn ekrano_render_thread(
 #[cfg(feature = "use_ekrano")]
 fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     use ekrano::GoldyRenderer;
-    use goldy::{DeviceDescriptor, Instance, PresentMode, RequestAdapterOptions, Surface, SurfaceConfig};
+    use goldy::{
+        DeviceDescriptor, Instance, PresentMode, RequestAdapterOptions, Surface, SurfaceConfig,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Sender};
     use std::sync::{Arc, Mutex};
@@ -1577,8 +1576,11 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 } else {
                     PresentMode::Immediate
                 };
+                let ctx_ui = device_ui
+                    .create_context()
+                    .expect("Failed to create goldy submission context");
                 let surf = Surface::new_with_config(
-                    &device_ui,
+                    &ctx_ui,
                     win.as_ref(),
                     SurfaceConfig {
                         present_mode: initial_mode,
