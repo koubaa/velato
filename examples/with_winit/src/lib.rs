@@ -17,9 +17,9 @@
     clippy::allow_attributes_without_reason
 )]
 
+use instant::Instant;
 #[cfg(feature = "use_vello")]
 use std::collections::HashSet;
-use instant::Instant;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -733,9 +733,7 @@ fn apply_render_cmd(
             if delta >= 0 {
                 input.complexity = input.complexity.saturating_add(delta as usize);
             } else {
-                input.complexity = input
-                    .complexity
-                    .saturating_sub((-delta) as usize);
+                input.complexity = input.complexity.saturating_sub((-delta) as usize);
             }
         }
         RenderCmd::ToggleStats => input.stats_shown = !input.stats_shown,
@@ -812,8 +810,7 @@ fn drain_commands(
     loop {
         match cmd_rx.try_recv() {
             Ok(cmd) => {
-                surface_dirty |=
-                    matches!(cmd, RenderCmd::Resize(..) | RenderCmd::ToggleVsync);
+                surface_dirty |= matches!(cmd, RenderCmd::Resize(..) | RenderCmd::ToggleVsync);
                 if !apply_render_cmd(cmd, surface, input, stats) {
                     return false;
                 }
@@ -860,9 +857,7 @@ fn build_ekrano_scene(
         interactive: true,
         complexity: input.complexity,
     };
-    example_scene
-        .function
-        .render(fragment, &mut scene_params);
+    example_scene.function.render(fragment, &mut scene_params);
 
     let resolved_base_color = base_color
         .or(scene_params.base_color)
@@ -1100,7 +1095,15 @@ fn take_stash_or_rebuild(
     let render_params = {
         let _tz = goldy::tracy_zone!("velato.build_scene_fallback");
         let stats_guard = stats.lock().expect("stats mutex poisoned");
-        build_ekrano_scene(scene, fragment, scenes, input, simple_text, &stats_guard, base_color)
+        build_ekrano_scene(
+            scene,
+            fragment,
+            scenes,
+            input,
+            simple_text,
+            &stats_guard,
+            base_color,
+        )
     };
     match renderer.prepare(scene, &render_params) {
         Ok(prepared) => RenderStep::Ok(prepared),
@@ -1163,7 +1166,15 @@ fn build_overlap_stash(
     let overlap_params = {
         let _tz = goldy::tracy_zone!("velato.build_scene_overlap");
         let stats_guard = stats.lock().expect("stats mutex poisoned");
-        build_ekrano_scene(scene, fragment, scenes, input, simple_text, &stats_guard, base_color)
+        build_ekrano_scene(
+            scene,
+            fragment,
+            scenes,
+            input,
+            simple_text,
+            &stats_guard,
+            base_color,
+        )
     };
     renderer.prepare(scene, &overlap_params).ok()
 }
@@ -1217,11 +1228,20 @@ fn ekrano_render_thread(
         if !block_until_surface(&cmd_rx, &mut surface, &mut input, &stats) {
             return;
         }
-        if !sync_present_and_drain(&mut present_in_flight, &presenter, &cmd_rx, &mut surface, &mut input, &stats) {
+        if !sync_present_and_drain(
+            &mut present_in_flight,
+            &presenter,
+            &cmd_rx,
+            &mut surface,
+            &mut input,
+            &stats,
+        ) {
             break;
         }
 
-        let Some(surface_ref) = surface.as_ref() else { continue };
+        let Some(surface_ref) = surface.as_ref() else {
+            continue;
+        };
         if input.width == 0 || input.height == 0 {
             continue;
         }
@@ -1237,9 +1257,16 @@ fn ekrano_render_thread(
 
         // Phase 2 — Prepare: reuse the overlap stash or rebuild the scene.
         let prepared = match take_stash_or_rebuild(
-            stash.take(), &mut renderer,
-            &mut scene, &mut fragment, &mut scenes,
-            &input, &mut simple_text, &stats, base_color, &device_lost,
+            stash.take(),
+            &mut renderer,
+            &mut scene,
+            &mut fragment,
+            &mut scenes,
+            &input,
+            &mut simple_text,
+            &stats,
+            base_color,
+            &device_lost,
         ) {
             RenderStep::Ok(p) => p,
             RenderStep::SkipFrame => continue,
@@ -1248,7 +1275,11 @@ fn ekrano_render_thread(
 
         // Phase 3 — Submit: encode GPU commands and acquire a swapchain image.
         let (frame_stats, frame) = match try_submit_prepared(
-            &mut renderer, &device, prepared, surface_ref, &device_lost,
+            &mut renderer,
+            &device,
+            prepared,
+            surface_ref,
+            &device_lost,
         ) {
             RenderStep::Ok(r) => r,
             RenderStep::SkipFrame => {
@@ -1265,7 +1296,7 @@ fn ekrano_render_thread(
                     input.width = s.width();
                     input.height = s.height();
                 }
-                continue
+                continue;
             }
             RenderStep::Shutdown => break,
         };
@@ -1286,8 +1317,13 @@ fn ekrano_render_thread(
         // TID_PRESENT calls swapchain.Present() for the frame just submitted.
         stash = build_overlap_stash(
             &mut renderer,
-            &mut scene, &mut fragment, &mut scenes,
-            &input, &mut simple_text, &stats, base_color,
+            &mut scene,
+            &mut fragment,
+            &mut scenes,
+            &input,
+            &mut simple_text,
+            &stats,
+            base_color,
         );
 
         let new_time = Instant::now();
@@ -1339,10 +1375,14 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
         .expect("No GPU adapter found")
         .request_device(&DeviceDescriptor::default())
         .expect("No GPU device found");
-    let device_ui = device.clone();
-
     let start_create = Instant::now();
     let renderer = GoldyRenderer::new(&device).expect("Failed to create ekrano renderer");
+    // Clone the renderer's submission context so the surface can be created on
+    // the same timeline semaphore as the renderer. This ensures gpu_progress()
+    // and BoundaryCrossed signals fired by the renderer's poller correctly
+    // reflect surface-frame completion — the fix for the RT-cache/reclamation
+    // mismatch introduced by goldy #179 increment 3a per-context timelines.
+    let render_ctx = renderer.submission_context();
     eprintln!("Creating ekrano renderer took {:?}", start_create.elapsed());
 
     let vsync = !args.no_vsync;
@@ -1576,11 +1616,8 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 } else {
                     PresentMode::Immediate
                 };
-                let ctx_ui = device_ui
-                    .create_context()
-                    .expect("Failed to create goldy submission context");
                 let surf = Surface::new_with_config(
-                    &ctx_ui,
+                    &render_ctx,
                     win.as_ref(),
                     SurfaceConfig {
                         present_mode: initial_mode,
@@ -1609,10 +1646,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
 
     let _ = render_thread.join();
 
-    let snap = bench_stats
-        .lock()
-        .expect("stats mutex poisoned")
-        .snapshot();
+    let snap = bench_stats.lock().expect("stats mutex poisoned").snapshot();
     eprintln!(
         "[bench] fps={:.1} frame_ms={:.3} min_ms={:.3} max_ms={:.3}",
         snap.fps, snap.frame_time_ms, snap.frame_time_min_ms, snap.frame_time_max_ms
