@@ -1127,12 +1127,11 @@ fn take_stash_or_rebuild(
 #[cfg(feature = "use_ekrano")]
 fn try_submit_prepared(
     renderer: &mut ekrano::GoldyRenderer,
-    device: &goldy::Device,
     prepared: ekrano::PreparedFrame,
     surface: &goldy::Surface,
     device_lost: &std::sync::atomic::AtomicBool,
 ) -> RenderStep<(ekrano::FrameStats, goldy::Frame)> {
-    match renderer.submit_prepared(device, prepared, surface) {
+    match renderer.submit_prepared(prepared, surface) {
         Ok(result) => RenderStep::Ok(result),
         Err(e) => {
             eprintln!("submit_prepared error: {e}");
@@ -1185,7 +1184,6 @@ fn build_overlap_stash(
 
 #[cfg(feature = "use_ekrano")]
 fn ekrano_render_thread(
-    device: goldy::Device,
     mut renderer: ekrano::GoldyRenderer,
     mut scenes: SceneSet,
     cmd_rx: std::sync::mpsc::Receiver<RenderCmd>,
@@ -1276,7 +1274,6 @@ fn ekrano_render_thread(
         // Phase 3 — Submit: encode GPU commands and acquire a swapchain image.
         let (frame_stats, frame) = match try_submit_prepared(
             &mut renderer,
-            &device,
             prepared,
             surface_ref,
             &device_lost,
@@ -1406,7 +1403,6 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     let bench_stats = Arc::clone(&stats);
     let render_thread = std::thread::spawn(move || {
         ekrano_render_thread(
-            device,
             renderer,
             scenes,
             cmd_rx,
