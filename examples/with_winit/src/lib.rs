@@ -665,6 +665,45 @@ pub fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 // Ekrano backend
 // ---------------------------------------------------------------------------
+
+/// Timestamped shutdown tracing (`RUST_LOG=velato::shutdown=info`).
+#[cfg(feature = "use_ekrano")]
+mod shutdown_trace {
+    use instant::Instant;
+    use std::sync::OnceLock;
+
+    static APP_START: OnceLock<Instant> = OnceLock::new();
+    static SHUTDOWN_START: OnceLock<Instant> = OnceLock::new();
+
+    fn app_start() -> Instant {
+        *APP_START.get_or_init(Instant::now)
+    }
+
+    pub(super) fn mark_initiated(reason: &str) {
+        let shutdown_start = *SHUTDOWN_START.get_or_init(Instant::now);
+        tracing::info!(
+            target: "velato::shutdown",
+            reason,
+            app_elapsed_ms = app_start().elapsed().as_millis() as u64,
+            shutdown_elapsed_ms = shutdown_start.elapsed().as_millis() as u64,
+            "shutdown initiated"
+        );
+    }
+
+    pub(super) fn phase(phase: &str, detail: &str) {
+        tracing::info!(
+            target: "velato::shutdown",
+            phase,
+            detail,
+            app_elapsed_ms = app_start().elapsed().as_millis() as u64,
+            shutdown_elapsed_ms = SHUTDOWN_START
+                .get()
+                .map(|t| t.elapsed().as_millis() as u64),
+            "shutdown phase"
+        );
+    }
+}
+
 #[cfg(feature = "use_ekrano")]
 fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()>) -> Arc<Window> {
     use winit::dpi::LogicalSize;
@@ -777,8 +816,14 @@ fn apply_render_cmd(
             input.height = height;
             *surface = Some(new_surface);
         }
-        RenderCmd::SurfaceDropped => *surface = None,
-        RenderCmd::Shutdown => return false,
+        RenderCmd::SurfaceDropped => {
+            shutdown_trace::phase("render_cmd", "SurfaceDropped");
+            *surface = None;
+        }
+        RenderCmd::Shutdown => {
+            shutdown_trace::phase("render_cmd", "Shutdown");
+            return false;
+        }
     }
     true
 }
@@ -816,7 +861,10 @@ fn drain_commands(
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => break,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                shutdown_trace::phase("drain_commands", "channel disconnected");
+                return false;
+            }
         }
     }
 
@@ -935,6 +983,7 @@ impl Presenter {
                             }
                         }
                     }
+                    shutdown_trace::phase("presenter", "TID_PRESENT thread exiting");
                 })
                 .expect("spawn TID_PRESENT");
             Self::Threaded {
@@ -983,15 +1032,26 @@ impl Presenter {
     }
 
     fn shutdown(self) {
+        shutdown_trace::phase("presenter", "shutdown begin");
         match self {
-            Self::Inline => {}
+            Self::Inline => {
+                shutdown_trace::phase("presenter", "inline mode (no join)");
+            }
             Self::Threaded { tx, mut handle, .. } => {
+                shutdown_trace::phase("presenter", "dropping present channel");
                 drop(tx);
                 if let Some(handle) = handle.take() {
+                    shutdown_trace::phase("presenter", "joining TID_PRESENT");
+                    let join_start = Instant::now();
                     let _ = handle.join();
+                    shutdown_trace::phase(
+                        "presenter",
+                        &format!("TID_PRESENT joined in {} ms", join_start.elapsed().as_millis()),
+                    );
                 }
             }
         }
+        shutdown_trace::phase("presenter", "shutdown complete");
     }
 }
 
@@ -1030,10 +1090,14 @@ fn block_until_surface(
         match cmd_rx.recv() {
             Ok(cmd) => {
                 if !apply_render_cmd(cmd, surface, input, stats) {
+                    shutdown_trace::phase("block_until_surface", "Shutdown received");
                     return false;
                 }
             }
-            Err(_) => return false,
+            Err(_) => {
+                shutdown_trace::phase("block_until_surface", "command channel disconnected");
+                return false;
+            }
         }
     }
     true
@@ -1062,6 +1126,10 @@ fn sync_present_and_drain(
     if *present_in_flight {
         let _tz = goldy::tracy_zone!("velato.wait_present_ack");
         if !presenter.wait_for_present_ack() {
+            shutdown_trace::phase(
+                "sync_present_and_drain",
+                "present ack channel closed (TID_PRESENT exited)",
+            );
             return false;
         }
         *present_in_flight = false;
@@ -1195,6 +1263,8 @@ fn ekrano_render_thread(
 ) {
     use std::sync::atomic::Ordering;
 
+    shutdown_trace::phase("render_thread", "TID_RENDER started");
+
     let start = Instant::now();
     let mut surface: Option<goldy::Surface> = None;
     let mut input = InputState {
@@ -1218,12 +1288,17 @@ fn ekrano_render_thread(
 
     loop {
         if device_lost.load(Ordering::Relaxed) {
+            shutdown_trace::phase("render_loop", "device_lost flag set");
             break;
         }
 
         // Phase 1 — Sync: wait for a surface, flush the previous present, then
         // consume any pending UI commands (resize, scene-switch, etc.).
         if !block_until_surface(&cmd_rx, &mut surface, &mut input, &stats) {
+            shutdown_trace::phase(
+                "render_thread",
+                "exit early from block_until_surface (presenter.shutdown skipped)",
+            );
             return;
         }
         if !sync_present_and_drain(
@@ -1234,6 +1309,7 @@ fn ekrano_render_thread(
             &mut input,
             &stats,
         ) {
+            shutdown_trace::phase("render_loop", "sync_present_and_drain returned false");
             break;
         }
 
@@ -1268,7 +1344,10 @@ fn ekrano_render_thread(
         ) {
             RenderStep::Ok(p) => p,
             RenderStep::SkipFrame => continue,
-            RenderStep::Shutdown => break,
+            RenderStep::Shutdown => {
+                shutdown_trace::phase("render_loop", "prepare failed (device lost)");
+                break;
+            }
         };
 
         // Phase 3 — Submit: encode GPU commands and acquire a swapchain image.
@@ -1295,7 +1374,10 @@ fn ekrano_render_thread(
                 }
                 continue;
             }
-            RenderStep::Shutdown => break,
+            RenderStep::Shutdown => {
+                shutdown_trace::phase("render_loop", "submit failed (device lost)");
+                break;
+            }
         };
 
         if frame_stats.bump_retries > 0 {
@@ -1306,6 +1388,7 @@ fn ekrano_render_thread(
         }
 
         if !presenter.send_frame(frame, &device_lost) {
+            shutdown_trace::phase("render_loop", "present channel closed");
             break;
         }
         present_in_flight = true;
@@ -1334,7 +1417,9 @@ fn ekrano_render_thread(
         frame_start_time = new_time;
     }
 
+    shutdown_trace::phase("render_thread", "render loop exited, dropping GoldyRenderer");
     presenter.shutdown();
+    shutdown_trace::phase("render_thread", "TID_RENDER exiting");
 }
 
 #[cfg(feature = "use_ekrano")]
@@ -1444,6 +1529,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 }
                 match event {
                     WindowEvent::CloseRequested => {
+                        shutdown_trace::mark_initiated("CloseRequested");
                         send_cmd(&cmd_tx, RenderCmd::Shutdown);
                         event_loop.exit();
                     }
@@ -1470,6 +1556,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                                     send_cmd(&cmd_tx, RenderCmd::TransformSet(transform));
                                 }
                                 Key::Named(NamedKey::Escape) => {
+                                    shutdown_trace::mark_initiated("Escape");
                                     send_cmd(&cmd_tx, RenderCmd::Shutdown);
                                     event_loop.exit();
                                 }
@@ -1578,12 +1665,14 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 }
                 if device_lost.load(Ordering::Relaxed) {
                     eprintln!("GPU device lost — exiting");
+                    shutdown_trace::mark_initiated("device_lost");
                     send_cmd(&cmd_tx, RenderCmd::Shutdown);
                     event_loop.exit();
                     return;
                 }
                 if let Some(deadline) = auto_exit_deadline {
                     if Instant::now() >= deadline {
+                        shutdown_trace::mark_initiated("auto_exit_timeout");
                         send_cmd(&cmd_tx, RenderCmd::Shutdown);
                         event_loop.exit();
                         return;
@@ -1633,6 +1722,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
             }
             Event::LoopExiting => {
                 let _tz = goldy::tracy_zone!("velato.ui_loop_exiting");
+                shutdown_trace::phase("ui", "LoopExiting — dropping command channel");
                 cmd_tx.take();
                 window = None;
             }
@@ -1640,13 +1730,24 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
         })
         .expect("run to completion");
 
+    shutdown_trace::phase("ui", "event loop returned");
+    let join_start = Instant::now();
+    shutdown_trace::phase("ui", "joining TID_RENDER");
     let _ = render_thread.join();
+    shutdown_trace::phase(
+        "ui",
+        &format!(
+            "TID_RENDER joined in {} ms",
+            join_start.elapsed().as_millis()
+        ),
+    );
 
     let snap = bench_stats.lock().expect("stats mutex poisoned").snapshot();
     eprintln!(
         "[bench] fps={:.1} frame_ms={:.3} min_ms={:.3} max_ms={:.3}",
         snap.fps, snap.frame_time_ms, snap.frame_time_min_ms, snap.frame_time_max_ms
     );
+    shutdown_trace::phase("ui", "about to drop Device and Instance on main thread");
 }
 
 /// # Panics
@@ -1662,10 +1763,12 @@ pub fn main() -> Result<()> {
     // for FPS comparisons against upstream vello. Goldy / ekrano startup
     // tracing and per-frame perf heartbeats are still reachable via
     // `RUST_LOG=goldy=info,ekrano=debug` or similar.
+    // Shutdown stall diagnosis: `RUST_LOG=velato::shutdown=info`.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
+        .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_writer(std::io::stderr)
         .try_init()
         .ok();
@@ -1679,6 +1782,7 @@ pub fn main() -> Result<()> {
     if let Some(scenes) = scenes {
         let event_loop = EventLoopBuilder::<()>::with_user_event().build()?;
         run_ekrano(event_loop, args, scenes);
+        shutdown_trace::phase("main", "run_ekrano returned (Device/Instance dropped)");
     }
     Ok(())
 }
