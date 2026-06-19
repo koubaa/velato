@@ -945,6 +945,9 @@ fn build_ekrano_scene(
 
 #[cfg(feature = "use_ekrano")]
 enum Presenter {
+    /// Synchronous present on the render thread. Retained for easy A/B testing;
+    /// `Presenter::new` currently always builds [`Self::Threaded`].
+    #[allow(dead_code)]
     Inline,
     Threaded {
         tx: std::sync::mpsc::SyncSender<goldy::Frame>,
@@ -958,39 +961,40 @@ enum Presenter {
 #[cfg(feature = "use_ekrano")]
 impl Presenter {
     fn new(device_lost: Arc<std::sync::atomic::AtomicBool>) -> Self {
-        if cfg!(target_os = "macos") {
-            Self::Inline
-        } else {
-            // Capacity 0 would be a rendezvous; 1 lets TID_RENDER stay one
-            // frame ahead of TID_PRESENT while still bounding the pipeline.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<goldy::Frame>(1);
-            let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
-            let dl = Arc::clone(&device_lost);
-            let handle = std::thread::Builder::new()
-                .name("TID_PRESENT".into())
-                .spawn(move || {
-                    while let Ok(frame) = rx.recv() {
-                        let _tz = goldy::tracy_zone!("frame.present.async");
-                        let result = frame.present();
-                        // Ack before checking error so TID_RENDER can proceed;
-                        // if the channel is closed TID_RENDER has already exited.
-                        let _ = ack_tx.send(());
-                        if let Err(e) = result {
-                            eprintln!("present error (TID_PRESENT): {e}");
-                            if is_device_lost_error(&e) {
-                                dl.store(true, std::sync::atomic::Ordering::Relaxed);
-                                break;
-                            }
+        // Capacity 0 would be a rendezvous; 1 lets TID_RENDER stay one
+        // frame ahead of TID_PRESENT while still bounding the pipeline.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<goldy::Frame>(1);
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let dl = Arc::clone(&device_lost);
+        let handle = std::thread::Builder::new()
+            .name("TID_PRESENT".into())
+            .spawn(move || {
+                // NOTE (macOS): this thread has no implicit autorelease pool.
+                // The Metal backend manages drawable/command-buffer lifetimes
+                // explicitly (retain on acquire, release on present), so this is
+                // expected to be safe; if Tracy shows per-frame growth or
+                // nextDrawable stalls, wrap each present in an `@autoreleasepool`.
+                while let Ok(frame) = rx.recv() {
+                    let _tz = goldy::tracy_zone!("frame.present.async");
+                    let result = frame.present();
+                    // Ack before checking error so TID_RENDER can proceed;
+                    // if the channel is closed TID_RENDER has already exited.
+                    let _ = ack_tx.send(());
+                    if let Err(e) = result {
+                        eprintln!("present error (TID_PRESENT): {e}");
+                        if is_device_lost_error(&e) {
+                            dl.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
                         }
                     }
-                    shutdown_trace::phase("presenter", "TID_PRESENT thread exiting");
-                })
-                .expect("spawn TID_PRESENT");
-            Self::Threaded {
-                tx,
-                ack_rx,
-                handle: Some(handle),
-            }
+                }
+                shutdown_trace::phase("presenter", "TID_PRESENT thread exiting");
+            })
+            .expect("spawn TID_PRESENT");
+        Self::Threaded {
+            tx,
+            ack_rx,
+            handle: Some(handle),
         }
     }
 
