@@ -718,9 +718,19 @@ fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()
     )
 }
 
+/// Wraps either a [`goldy::Surface`] (Classic path) or a [`goldy::SwapchainPool`]
+/// (Scheme path) so both can flow through the same command channel.
+///
+/// Deleted with the Classic (TaskGraph) backend in Phase 6.
+#[cfg(feature = "use_ekrano")]
+enum SurfaceOrPool {
+    Classic(goldy::Surface),
+    Scheme(goldy::SwapchainPool),
+}
+
 #[cfg(feature = "use_ekrano")]
 enum RenderCmd {
-    SurfaceCreated(goldy::Surface),
+    SurfaceCreated(SurfaceOrPool),
     SurfaceDropped,
     TransformSet(Affine),
     SceneDelta(i32),
@@ -759,7 +769,7 @@ fn is_device_lost_error(err: &impl std::fmt::Display) -> bool {
 #[cfg(feature = "use_ekrano")]
 fn apply_render_cmd(
     cmd: RenderCmd,
-    surface: &mut Option<goldy::Surface>,
+    surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
 ) -> bool {
@@ -783,21 +793,21 @@ fn apply_render_cmd(
         }
         RenderCmd::ToggleVsync => {
             input.vsync = !input.vsync;
-            let Some(surface) = surface.as_mut() else {
-                return true;
-            };
-            let mode = if input.vsync {
-                PresentMode::Fifo
-            } else {
-                PresentMode::Immediate
-            };
-            match surface.set_present_mode(mode) {
-                Ok(()) => eprintln!(
-                    "Vsync: {} (present mode: {:?})",
-                    if input.vsync { "ON" } else { "OFF" },
-                    mode
-                ),
-                Err(e) => eprintln!("Failed to set present mode: {e}"),
+            let mode = if input.vsync { PresentMode::Fifo } else { PresentMode::Immediate };
+            match surface_or_pool.as_mut() {
+                None => return true,
+                Some(SurfaceOrPool::Classic(s)) => {
+                    match s.set_present_mode(mode) {
+                        Ok(()) => eprintln!("Vsync: {} (present mode: {:?})", if input.vsync { "ON" } else { "OFF" }, mode),
+                        Err(e) => eprintln!("Failed to set present mode: {e}"),
+                    }
+                }
+                Some(SurfaceOrPool::Scheme(p)) => {
+                    match p.set_present_mode(mode) {
+                        Ok(()) => eprintln!("Vsync: {} (present mode: {:?})", if input.vsync { "ON" } else { "OFF" }, mode),
+                        Err(e) => eprintln!("Failed to set present mode: {e}"),
+                    }
+                }
             }
         }
         RenderCmd::Resize(width, height) => {
@@ -810,15 +820,18 @@ fn apply_render_cmd(
             input.width = width;
             input.height = height;
         }
-        RenderCmd::SurfaceCreated(new_surface) => {
-            let (width, height) = new_surface.size();
+        RenderCmd::SurfaceCreated(sop) => {
+            let (width, height) = match &sop {
+                SurfaceOrPool::Classic(s) => s.size(),
+                SurfaceOrPool::Scheme(p) => p.size(),
+            };
             input.width = width;
             input.height = height;
-            *surface = Some(new_surface);
+            *surface_or_pool = Some(sop);
         }
         RenderCmd::SurfaceDropped => {
             shutdown_trace::phase("render_cmd", "SurfaceDropped");
-            *surface = None;
+            *surface_or_pool = None;
         }
         RenderCmd::Shutdown => {
             shutdown_trace::phase("render_cmd", "Shutdown");
@@ -831,7 +844,7 @@ fn apply_render_cmd(
 #[cfg(feature = "use_ekrano")]
 fn drain_commands(
     cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
-    surface: &mut Option<goldy::Surface>,
+    surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
 ) -> bool {
@@ -856,7 +869,7 @@ fn drain_commands(
         match cmd_rx.try_recv() {
             Ok(cmd) => {
                 surface_dirty |= matches!(cmd, RenderCmd::Resize(..) | RenderCmd::ToggleVsync);
-                if !apply_render_cmd(cmd, surface, input, stats) {
+                if !apply_render_cmd(cmd, surface_or_pool, input, stats) {
                     return false;
                 }
             }
@@ -870,13 +883,20 @@ fn drain_commands(
 
     if surface_dirty {
         // A present-mode change (ToggleVsync) requires an immediate swapchain rebuild before
-        // the next frame. The surface may clamp the requested dimensions to its capability
-        // limits (Surface::resize reads back the backend's actual extent), so sync
-        // input.width/height to the real swapchain afterwards.
-        if let Some(s) = surface.as_mut() {
-            let _ = s.resize(input.width, input.height);
-            input.width = s.width();
-            input.height = s.height();
+        // the next frame. The surface/pool may clamp the requested dimensions to its capability
+        // limits, so sync input.width/height to the real swapchain afterwards.
+        match surface_or_pool.as_mut() {
+            Some(SurfaceOrPool::Classic(s)) => {
+                let _ = s.resize(input.width, input.height);
+                input.width = s.width();
+                input.height = s.height();
+            }
+            Some(SurfaceOrPool::Scheme(p)) => {
+                let _ = p.resize(input.width, input.height);
+                input.width = p.width();
+                input.height = p.height();
+            }
+            None => {}
         }
     }
     true
@@ -1085,15 +1105,15 @@ enum RenderStep<T> {
 #[cfg(feature = "use_ekrano")]
 fn block_until_surface(
     cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
-    surface: &mut Option<goldy::Surface>,
+    surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
 ) -> bool {
-    while surface.is_none() {
+    while surface_or_pool.is_none() {
         let _tz = goldy::tracy_zone!("velato.wait_surface");
         match cmd_rx.recv() {
             Ok(cmd) => {
-                if !apply_render_cmd(cmd, surface, input, stats) {
+                if !apply_render_cmd(cmd, surface_or_pool, input, stats) {
                     shutdown_trace::phase("block_until_surface", "Shutdown received");
                     return false;
                 }
@@ -1123,7 +1143,7 @@ fn sync_present_and_drain(
     present_in_flight: &mut bool,
     presenter: &Presenter,
     cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
-    surface: &mut Option<goldy::Surface>,
+    surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
 ) -> bool {
@@ -1138,7 +1158,7 @@ fn sync_present_and_drain(
         }
         *present_in_flight = false;
     }
-    drain_commands(cmd_rx, surface, input, stats)
+    drain_commands(cmd_rx, surface_or_pool, input, stats)
 }
 
 /// Returns the stashed `PreparedFrame` when its dimensions still match the
@@ -1217,6 +1237,35 @@ fn try_submit_prepared(
     }
 }
 
+/// Submits a [`PreparedFrame`] to the Scheme swapchain pool and presents synchronously.
+///
+/// Unlike [`try_submit_prepared`], no [`goldy::Frame`] is returned because
+/// `submit_to_swapchain` calls `grant.consume` internally — present completes before
+/// this function returns, so `TID_PRESENT` is not involved.
+///
+/// Returns [`RenderStep::SkipFrame`] on a transient error and
+/// [`RenderStep::Shutdown`] on device loss.
+#[cfg(feature = "use_ekrano")]
+fn try_submit_to_swapchain(
+    renderer: &mut ekrano::GoldyRenderer,
+    prepared: ekrano::PreparedFrame,
+    pool: &goldy::SwapchainPool,
+    device_lost: &std::sync::atomic::AtomicBool,
+) -> RenderStep<ekrano::FrameStats> {
+    match renderer.submit_to_swapchain(prepared, pool) {
+        Ok(stats) => RenderStep::Ok(stats),
+        Err(e) => {
+            eprintln!("submit_to_swapchain error: {e}");
+            if is_device_lost_error(&e) {
+                device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                RenderStep::Shutdown
+            } else {
+                RenderStep::SkipFrame
+            }
+        }
+    }
+}
+
 /// Speculatively builds the *next* frame's `PreparedFrame` while `TID_PRESENT`
 /// is busy calling `swapchain.Present()` for the frame just submitted.
 ///
@@ -1270,7 +1319,6 @@ fn ekrano_render_thread(
     shutdown_trace::phase("render_thread", "TID_RENDER started");
 
     let start = Instant::now();
-    let mut surface: Option<goldy::Surface> = None;
     let mut input = InputState {
         transform: Affine::IDENTITY,
         scene_ix: initial_scene_ix,
@@ -1289,6 +1337,7 @@ fn ekrano_render_thread(
     let mut frame_start_time = Instant::now();
     let presenter = Presenter::new(Arc::clone(&device_lost));
     let mut present_in_flight = false;
+    let mut surface_or_pool: Option<SurfaceOrPool> = None;
 
     loop {
         if device_lost.load(Ordering::Relaxed) {
@@ -1296,9 +1345,9 @@ fn ekrano_render_thread(
             break;
         }
 
-        // Phase 1 — Sync: wait for a surface, flush the previous present, then
+        // Phase 1 — Sync: wait for a surface/pool, flush the previous present, then
         // consume any pending UI commands (resize, scene-switch, etc.).
-        if !block_until_surface(&cmd_rx, &mut surface, &mut input, &stats) {
+        if !block_until_surface(&cmd_rx, &mut surface_or_pool, &mut input, &stats) {
             shutdown_trace::phase(
                 "render_thread",
                 "exit early from block_until_surface (presenter.shutdown skipped)",
@@ -1309,7 +1358,7 @@ fn ekrano_render_thread(
             &mut present_in_flight,
             &presenter,
             &cmd_rx,
-            &mut surface,
+            &mut surface_or_pool,
             &mut input,
             &stats,
         ) {
@@ -1317,9 +1366,9 @@ fn ekrano_render_thread(
             break;
         }
 
-        let Some(surface_ref) = surface.as_ref() else {
+        if surface_or_pool.is_none() {
             continue;
-        };
+        }
         if input.width == 0 || input.height == 0 {
             continue;
         }
@@ -1354,61 +1403,116 @@ fn ekrano_render_thread(
             }
         };
 
-        // Phase 3 — Submit: encode GPU commands and acquire a swapchain image.
-        let (frame_stats, frame) = match try_submit_prepared(
-            &mut renderer,
-            prepared,
-            surface_ref,
-            &device_lost,
-        ) {
-            RenderStep::Ok(r) => r,
-            RenderStep::SkipFrame => {
-                // Swapchain is out of date (ERROR_OUT_OF_DATE_KHR from acquire_next_image).
-                // Rebuild it reactively at the latest requested dimensions. Doing this here
-                // — rather than proactively in drain_commands — prevents the cascade of
-                // consecutive present failures caused by rebuilding before Vulkan says it
-                // is needed: that triggered device_wait_idle, during which the window moved
-                // further, making each new swapchain immediately stale.
-                if let Some(s) = surface.as_mut() {
-                    let _ = s.resize(input.width, input.height);
-                    // Sync input so the next frame uses the actual swapchain dimensions
-                    // (may differ from requested due to Vulkan capability clamping).
-                    input.width = s.width();
-                    input.height = s.height();
+        // Phase 3 — Submit: branch on backend.
+        //
+        // Classic: submit_prepared acquires a swapchain image and returns a Frame token;
+        //          TID_PRESENT calls frame.present() asynchronously.
+        // Scheme:  submit_to_swapchain presents synchronously via grant.consume inside the
+        //          call, so no Frame token is produced and TID_PRESENT is not involved.
+        let is_scheme = matches!(surface_or_pool, Some(SurfaceOrPool::Scheme(_)));
+        if is_scheme {
+            let frame_stats: ekrano::FrameStats;
+            {
+                // Scope limits the immutable borrow of surface_or_pool so the SkipFrame
+                // arm can reborrow it for the reactive resize.
+                let pool_ref = match surface_or_pool.as_ref().unwrap() {
+                    SurfaceOrPool::Scheme(p) => p,
+                    _ => unreachable!(),
+                };
+                let submit = try_submit_to_swapchain(&mut renderer, prepared, pool_ref, &device_lost);
+                match submit {
+                    RenderStep::Ok(s) => frame_stats = s,
+                    RenderStep::SkipFrame => {
+                        // NLL ends the pool_ref borrow at the last use above; reborrow is safe.
+                        if let Some(SurfaceOrPool::Scheme(p)) = surface_or_pool.as_ref() {
+                            let _ = p.resize(input.width, input.height);
+                            input.width = p.width();
+                            input.height = p.height();
+                        }
+                        continue;
+                    }
+                    RenderStep::Shutdown => {
+                        shutdown_trace::phase("render_loop", "submit failed (device lost)");
+                        break;
+                    }
                 }
-                continue;
             }
-            RenderStep::Shutdown => {
-                shutdown_trace::phase("render_loop", "submit failed (device lost)");
+            if frame_stats.bump_retries > 0 {
+                eprintln!(
+                    "[BUMP] bump allocator reallocated {} time(s) this frame",
+                    frame_stats.bump_retries,
+                );
+            }
+            // Phase 4 — Overlap (Scheme): present already completed above.
+            stash = build_overlap_stash(
+                &mut renderer,
+                &mut scene,
+                &mut fragment,
+                &mut scenes,
+                &input,
+                &mut simple_text,
+                &stats,
+                base_color,
+            );
+        } else {
+            // Classic path.
+            let (frame_stats, frame): (ekrano::FrameStats, goldy::Frame);
+            {
+                let surface_ref = match surface_or_pool.as_ref().unwrap() {
+                    SurfaceOrPool::Classic(s) => s,
+                    _ => unreachable!(),
+                };
+                let submit = try_submit_prepared(&mut renderer, prepared, surface_ref, &device_lost);
+                match submit {
+                    RenderStep::Ok(r) => (frame_stats, frame) = r,
+                    RenderStep::SkipFrame => {
+                        // Swapchain is out of date (ERROR_OUT_OF_DATE_KHR from acquire_next_image).
+                        // Rebuild it reactively at the latest requested dimensions. Doing this here
+                        // — rather than proactively in drain_commands — prevents the cascade of
+                        // consecutive present failures caused by rebuilding before Vulkan says it
+                        // is needed: that triggered device_wait_idle, during which the window moved
+                        // further, making each new swapchain immediately stale.
+                        // NLL ends the surface_ref borrow at the last use above; reborrow is safe.
+                        if let Some(SurfaceOrPool::Classic(s)) = surface_or_pool.as_mut() {
+                            let _ = s.resize(input.width, input.height);
+                            // Sync input so the next frame uses the actual swapchain dimensions
+                            // (may differ from requested due to Vulkan capability clamping).
+                            input.width = s.width();
+                            input.height = s.height();
+                        }
+                        continue;
+                    }
+                    RenderStep::Shutdown => {
+                        shutdown_trace::phase("render_loop", "submit failed (device lost)");
+                        break;
+                    }
+                }
+            }
+            if frame_stats.bump_retries > 0 {
+                eprintln!(
+                    "[BUMP] bump allocator reallocated {} time(s) this frame",
+                    frame_stats.bump_retries,
+                );
+            }
+            if !presenter.send_frame(frame, &device_lost) {
+                shutdown_trace::phase("render_loop", "present channel closed");
                 break;
             }
-        };
+            present_in_flight = true;
 
-        if frame_stats.bump_retries > 0 {
-            eprintln!(
-                "[BUMP] bump allocator reallocated {} time(s) this frame",
-                frame_stats.bump_retries,
+            // Phase 4 — Overlap: build the next frame's scene on the CPU while
+            // TID_PRESENT calls swapchain.Present() for the frame just submitted.
+            stash = build_overlap_stash(
+                &mut renderer,
+                &mut scene,
+                &mut fragment,
+                &mut scenes,
+                &input,
+                &mut simple_text,
+                &stats,
+                base_color,
             );
         }
-
-        if !presenter.send_frame(frame, &device_lost) {
-            shutdown_trace::phase("render_loop", "present channel closed");
-            break;
-        }
-        present_in_flight = true;
-
-        // Phase 4 — Overlap: build the next frame's scene on the CPU while
-        // TID_PRESENT calls swapchain.Present() for the frame just submitted.
-        stash = build_overlap_stash(
-            &mut renderer,
-            &mut scene,
-            &mut fragment,
-            &mut scenes,
-            &input,
-            &mut simple_text,
-            &stats,
-            base_color,
-        );
 
         let new_time = Instant::now();
         let _tz = goldy::tracy_zone!("velato.record_stats");
@@ -1431,6 +1535,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     use ekrano::GoldyRenderer;
     use goldy::{
         DeviceDescriptor, Instance, PresentMode, RequestAdapterOptions, Surface, SurfaceConfig,
+        SwapchainPool,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Sender};
@@ -1469,6 +1574,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     // reflect surface-frame completion — the fix for the RT-cache/reclamation
     // mismatch introduced by goldy #179 increment 3a per-context timelines.
     let render_ctx = renderer.submission_context();
+    let backend = renderer.backend();
     eprintln!("Creating ekrano renderer took {:?}", start_create.elapsed());
 
     let vsync = !args.no_vsync;
@@ -1705,16 +1811,28 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 } else {
                     PresentMode::Immediate
                 };
-                let surf = Surface::new_with_config(
-                    &render_ctx,
-                    win.as_ref(),
-                    SurfaceConfig {
-                        present_mode: initial_mode,
-                        depth_format: None,
-                    },
-                )
-                .expect("Failed to create goldy surface");
-                send_cmd(&cmd_tx, RenderCmd::SurfaceCreated(surf));
+                let config = SurfaceConfig {
+                    present_mode: initial_mode,
+                    depth_format: None,
+                };
+                let sop = match backend {
+                    ekrano::GoldyBackend::Classic => {
+                        let surf = Surface::new_with_config(&render_ctx, win.as_ref(), config)
+                            .expect("Failed to create goldy surface");
+                        SurfaceOrPool::Classic(surf)
+                    }
+                    ekrano::GoldyBackend::Scheme => {
+                        let pool = SwapchainPool::new_with_config(
+                            &render_ctx,
+                            win.as_ref(),
+                            1,
+                            config,
+                        )
+                        .expect("Failed to create goldy swapchain pool");
+                        SurfaceOrPool::Scheme(pool)
+                    }
+                };
+                send_cmd(&cmd_tx, RenderCmd::SurfaceCreated(sop));
                 window = Some(win);
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
