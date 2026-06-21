@@ -964,13 +964,19 @@ fn build_ekrano_scene(
 }
 
 #[cfg(feature = "use_ekrano")]
+enum PresentPayload {
+    Classic(goldy::Frame),
+    Scheme(ekrano::PresentToken),
+}
+
+#[cfg(feature = "use_ekrano")]
 enum Presenter {
     /// Synchronous present on the render thread. Retained for easy A/B testing;
     /// `Presenter::new` currently always builds [`Self::Threaded`].
     #[allow(dead_code)]
     Inline,
     Threaded {
-        tx: std::sync::mpsc::SyncSender<goldy::Frame>,
+        tx: std::sync::mpsc::SyncSender<PresentPayload>,
         /// Receives one `()` per presented frame, so TID_RENDER can wait for
         /// present-N to complete before acquiring image N+1.
         ack_rx: std::sync::mpsc::Receiver<()>,
@@ -983,7 +989,7 @@ impl Presenter {
     fn new(device_lost: Arc<std::sync::atomic::AtomicBool>) -> Self {
         // Capacity 0 would be a rendezvous; 1 lets TID_RENDER stay one
         // frame ahead of TID_PRESENT while still bounding the pipeline.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<goldy::Frame>(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PresentPayload>(1);
         let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let dl = Arc::clone(&device_lost);
         let handle = std::thread::Builder::new()
@@ -994,13 +1000,16 @@ impl Presenter {
                 // explicitly (retain on acquire, release on present), so this is
                 // expected to be safe; if Tracy shows per-frame growth or
                 // nextDrawable stalls, wrap each present in an `@autoreleasepool`.
-                while let Ok(frame) = rx.recv() {
+                while let Ok(payload) = rx.recv() {
                     let _tz = goldy::tracy_zone!("frame.present.async");
-                    let result = frame.present();
+                    let present_err: Option<String> = match payload {
+                        PresentPayload::Classic(frame) => frame.present().err().map(|e| e.to_string()),
+                        PresentPayload::Scheme(token) => token.present().err().map(|e| e.to_string()),
+                    };
                     // Ack before checking error so TID_RENDER can proceed;
                     // if the channel is closed TID_RENDER has already exited.
                     let _ = ack_tx.send(());
-                    if let Err(e) = result {
+                    if let Some(e) = present_err {
                         eprintln!("present error (TID_PRESENT): {e}");
                         if is_device_lost_error(&e) {
                             dl.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1022,14 +1031,18 @@ impl Presenter {
     ///
     /// For `Threaded`, this is non-blocking (the channel has capacity 1).
     /// TID_RENDER must call [`wait_for_present_ack`] before the next
-    /// `submit_prepared` (which internally acquires the next swapchain image).
-    fn send_frame(&self, frame: goldy::Frame, device_lost: &std::sync::atomic::AtomicBool) -> bool {
+    /// submit (which internally acquires the next swapchain image).
+    fn send_payload(&self, payload: PresentPayload, device_lost: &std::sync::atomic::AtomicBool) -> bool {
         use std::sync::atomic::Ordering;
 
         let _tz = goldy::tracy_zone!("velato.present_send");
         match self {
             Self::Inline => {
-                if let Err(e) = frame.present() {
+                let present_err: Option<String> = match payload {
+                    PresentPayload::Classic(frame) => frame.present().err().map(|e| e.to_string()),
+                    PresentPayload::Scheme(token) => token.present().err().map(|e| e.to_string()),
+                };
+                if let Some(e) = present_err {
                     eprintln!("present error: {e}");
                     if is_device_lost_error(&e) {
                         device_lost.store(true, Ordering::Relaxed);
@@ -1038,8 +1051,20 @@ impl Presenter {
                 }
                 true
             }
-            Self::Threaded { tx, .. } => tx.send(frame).is_ok(),
+            Self::Threaded { tx, .. } => tx.send(payload).is_ok(),
         }
+    }
+
+    fn send_frame(&self, frame: goldy::Frame, device_lost: &std::sync::atomic::AtomicBool) -> bool {
+        self.send_payload(PresentPayload::Classic(frame), device_lost)
+    }
+
+    fn send_present_token(
+        &self,
+        token: ekrano::PresentToken,
+        device_lost: &std::sync::atomic::AtomicBool,
+    ) -> bool {
+        self.send_payload(PresentPayload::Scheme(token), device_lost)
     }
 
     /// Block until TID_PRESENT has finished `frame.present()` for the
@@ -1237,11 +1262,8 @@ fn try_submit_prepared(
     }
 }
 
-/// Submits a [`PreparedFrame`] to the Scheme swapchain pool and presents synchronously.
-///
-/// Unlike [`try_submit_prepared`], no [`goldy::Frame`] is returned because
-/// `submit_to_swapchain` calls `grant.consume` internally — present completes before
-/// this function returns, so `TID_PRESENT` is not involved.
+/// Submits a [`PreparedFrame`] to the Scheme swapchain pool and returns a
+/// [`PresentToken`] for async scanout on TID_PRESENT.
 ///
 /// Returns [`RenderStep::SkipFrame`] on a transient error and
 /// [`RenderStep::Shutdown`] on device loss.
@@ -1251,9 +1273,9 @@ fn try_submit_to_swapchain(
     prepared: ekrano::PreparedFrame,
     pool: &goldy::SwapchainPool,
     device_lost: &std::sync::atomic::AtomicBool,
-) -> RenderStep<ekrano::FrameStats> {
+) -> RenderStep<(ekrano::FrameStats, ekrano::PresentToken)> {
     match renderer.submit_to_swapchain(prepared, pool) {
-        Ok(stats) => RenderStep::Ok(stats),
+        Ok(result) => RenderStep::Ok(result),
         Err(e) => {
             eprintln!("submit_to_swapchain error: {e}");
             if is_device_lost_error(&e) {
@@ -1407,11 +1429,11 @@ fn ekrano_render_thread(
         //
         // Classic: submit_prepared acquires a swapchain image and returns a Frame token;
         //          TID_PRESENT calls frame.present() asynchronously.
-        // Scheme:  submit_to_swapchain presents synchronously via grant.consume inside the
-        //          call, so no Frame token is produced and TID_PRESENT is not involved.
+        // Scheme:  submit_to_swapchain returns a PresentToken; TID_PRESENT calls
+        //          grant.consume() asynchronously.
         let is_scheme = matches!(surface_or_pool, Some(SurfaceOrPool::Scheme(_)));
         if is_scheme {
-            let frame_stats: ekrano::FrameStats;
+            let (frame_stats, present_token): (ekrano::FrameStats, ekrano::PresentToken);
             {
                 // Scope limits the immutable borrow of surface_or_pool so the SkipFrame
                 // arm can reborrow it for the reactive resize.
@@ -1421,7 +1443,7 @@ fn ekrano_render_thread(
                 };
                 let submit = try_submit_to_swapchain(&mut renderer, prepared, pool_ref, &device_lost);
                 match submit {
-                    RenderStep::Ok(s) => frame_stats = s,
+                    RenderStep::Ok(r) => (frame_stats, present_token) = r,
                     RenderStep::SkipFrame => {
                         // NLL ends the pool_ref borrow at the last use above; reborrow is safe.
                         if let Some(SurfaceOrPool::Scheme(p)) = surface_or_pool.as_ref() {
@@ -1443,7 +1465,14 @@ fn ekrano_render_thread(
                     frame_stats.bump_retries,
                 );
             }
-            // Phase 4 — Overlap (Scheme): present already completed above.
+            if !presenter.send_present_token(present_token, &device_lost) {
+                shutdown_trace::phase("render_loop", "present channel closed");
+                break;
+            }
+            present_in_flight = true;
+
+            // Phase 4 — Overlap: build the next frame's scene on the CPU while
+            // TID_PRESENT presents the frame just submitted.
             stash = build_overlap_stash(
                 &mut renderer,
                 &mut scene,
