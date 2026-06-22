@@ -848,56 +848,78 @@ fn drain_commands(
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
 ) -> bool {
+    let surface_dirty = drain_commands_without_resize(cmd_rx, surface_or_pool, input, stats);
+    match surface_dirty {
+        DrainResult::Shutdown => false,
+        DrainResult::Idle => true,
+        DrainResult::SurfaceDirty => apply_deferred_surface_resize(surface_or_pool, input),
+    }
+}
+
+#[cfg(feature = "use_ekrano")]
+enum DrainResult {
+    Shutdown,
+    Idle,
+    SurfaceDirty,
+}
+
+#[cfg(feature = "use_ekrano")]
+fn drain_commands_without_resize(
+    cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
+    surface_or_pool: &mut Option<SurfaceOrPool>,
+    input: &mut InputState,
+    stats: &Arc<std::sync::Mutex<stats::Stats>>,
+) -> DrainResult {
     let _tz = goldy::tracy_zone!("velato.drain_commands");
     // Set when a command that can change surface dimensions or present mode is drained.
-    // The deferred resize at the bottom fires exactly once when this is true, batching
-    // any burst of per-pixel Resize events from a smooth window drag into a single
-    // swapchain rebuild (one device_wait_idle) instead of one per event.
-    //
-    // Backend notes:
-    //   Vulkan  — the rebuild here may be followed by a present failure on the very
-    //             next frame if the window kept moving during device_wait_idle. That is
-    //             handled by the reactive SkipFrame path in the render loop which then
-    //             rebuilds to the latest dimensions. Present failures are debug-level
-    //             only (see goldy queue_present logging) so this is not user-visible.
-    //   DX12    — DXGI has no "out-of-date" signal; without the proactive rebuild here
-    //             the swapchain would silently stretch for the life of the drag gesture.
-    //   Metal   — CAMetalLayer reads drawableSize on every acquire and self-corrects,
-    //             so the rebuild here is a no-op if the layer already resized itself.
+    // The deferred resize fires exactly once when this is true, batching any burst of
+    // per-pixel Resize events from a smooth window drag into a single swapchain rebuild.
     let mut surface_dirty = false;
     loop {
         match cmd_rx.try_recv() {
             Ok(cmd) => {
                 surface_dirty |= matches!(cmd, RenderCmd::Resize(..) | RenderCmd::ToggleVsync);
                 if !apply_render_cmd(cmd, surface_or_pool, input, stats) {
-                    return false;
+                    return DrainResult::Shutdown;
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => break,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 shutdown_trace::phase("drain_commands", "channel disconnected");
-                return false;
+                return DrainResult::Shutdown;
             }
         }
     }
 
     if surface_dirty {
-        // A present-mode change (ToggleVsync) requires an immediate swapchain rebuild before
-        // the next frame. The surface/pool may clamp the requested dimensions to its capability
-        // limits, so sync input.width/height to the real swapchain afterwards.
-        match surface_or_pool.as_mut() {
-            Some(SurfaceOrPool::Classic(s)) => {
-                let _ = s.resize(input.width, input.height);
-                input.width = s.width();
-                input.height = s.height();
-            }
-            Some(SurfaceOrPool::Scheme(p)) => {
-                let _ = p.resize(input.width, input.height);
-                input.width = p.width();
-                input.height = p.height();
-            }
-            None => {}
+        DrainResult::SurfaceDirty
+    } else {
+        DrainResult::Idle
+    }
+}
+
+#[cfg(feature = "use_ekrano")]
+fn apply_deferred_surface_resize(surface_or_pool: &mut Option<SurfaceOrPool>, input: &mut InputState) -> bool {
+    // A present-mode change (ToggleVsync) requires an immediate swapchain rebuild before
+    // the next frame. The surface/pool may clamp the requested dimensions to its capability
+    // limits, so sync input.width/height to the real swapchain afterwards.
+    match surface_or_pool.as_mut() {
+        Some(SurfaceOrPool::Classic(s)) => {
+            let _ = s.resize(input.width, input.height);
+            input.width = s.width();
+            input.height = s.height();
         }
+        Some(SurfaceOrPool::Scheme(p)) => {
+            let before = (input.width, input.height);
+            let _ = p.resize(input.width, input.height);
+            input.width = p.width();
+            input.height = p.height();
+            eprintln!(
+                "[velato] deferred resize: {}x{} -> {}x{}",
+                before.0, before.1, input.width, input.height
+            );
+        }
+        None => {}
     }
     true
 }
@@ -1029,9 +1051,9 @@ impl Presenter {
 
     /// Dispatch a frame to present. Returns `false` if the render loop should exit.
     ///
-    /// For `Threaded`, this is non-blocking (the channel has capacity 1).
-    /// TID_RENDER must call [`wait_for_present_ack`] before the next
-    /// submit (which internally acquires the next swapchain image).
+    /// For `Threaded`, this is non-blocking when the channel has capacity (depth 1).
+    /// The next acquire/record/submit may overlap TID_PRESENT; backpressure is on
+    /// the bounded channel and acquire-side frame-latency waits.
     fn send_payload(&self, payload: PresentPayload, device_lost: &std::sync::atomic::AtomicBool) -> bool {
         use std::sync::atomic::Ordering;
 
@@ -1067,16 +1089,24 @@ impl Presenter {
         self.send_payload(PresentPayload::Scheme(token), device_lost)
     }
 
-    /// Block until TID_PRESENT has finished `frame.present()` for the
-    /// previously sent frame. Must be called before the next `submit_prepared`
-    /// because the DX12 backend's acquire reads single-valued surface state
-    /// that `present` also writes — they cannot race.
+    /// Block until TID_PRESENT has finished presenting the previously sent frame.
+    ///
+    /// Required before swapchain rebuilds (`resize` / present-mode changes) because
+    /// both paths take the backend mutex and rebuild live swapchain images.
     ///
     /// On `Inline` this is a no-op (present already completed synchronously).
     fn wait_for_present_ack(&self) -> bool {
         match self {
             Self::Inline => true,
             Self::Threaded { ack_rx, .. } => ack_rx.recv().is_ok(),
+        }
+    }
+
+    /// Non-blocking check whether TID_PRESENT finished the in-flight frame.
+    fn try_present_ack(&self) -> bool {
+        match self {
+            Self::Inline => true,
+            Self::Threaded { ack_rx, .. } => ack_rx.try_recv().is_ok(),
         }
     }
 
@@ -1152,15 +1182,27 @@ fn block_until_surface(
     true
 }
 
-/// Waits for `TID_PRESENT` to acknowledge the previous frame, then drains
-/// any pending UI commands.
+/// Drains pending UI commands, then applies deferred resize when needed.
 ///
-/// **Ordering guarantee:** `wait_for_present_ack` must complete before
-/// `drain_commands` because draining can call `surface.resize()` (and other
-/// surface-mutating operations). Both `resize` and `present_frame` lock the
-/// same backend mutex, so whichever wins first determines the outcome.
-/// Draining first would let a `Resize` command clear `current_image_index`
-/// before `TID_PRESENT` reads it, producing "No image to present".
+/// **Ordering guarantee (resize):** when a drained command requires swapchain
+/// rebuild (`Resize` / `ToggleVsync`), `wait_for_present_ack` must complete
+/// before `apply_deferred_surface_resize` because both `resize` and
+/// `present_frame` lock the same backend mutex and rebuild/read live swapchain
+/// images.
+///
+/// **Ordering guarantee (normal path):** `wait_for_present_ack` is also
+/// required before every acquire, because `GetCurrentBackBufferIndex` must
+/// observe the previous `swapchain.Present()` call to rotate to the next
+/// backbuffer.  Without this gate two consecutive acquires read the same
+/// backbuffer index and produce two FrameTokens for the same image; both
+/// presents then copy to the same backbuffer concurrently, corrupting GPU
+/// state.
+///
+/// CPU scene-building overlap is preserved: `build_overlap_stash` (Phase 4)
+/// runs *after* `send_present_token` and *before* this function, so the
+/// render thread still overlaps scene construction with TID_PRESENT's GPU
+/// copy/present.  Acquire/record/submit overlap requires N-backed swapchain
+/// slots and is deferred to future work.
 ///
 /// Returns `false` if the render loop should exit.
 #[cfg(feature = "use_ekrano")]
@@ -1172,18 +1214,43 @@ fn sync_present_and_drain(
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
 ) -> bool {
-    if *present_in_flight {
-        let _tz = goldy::tracy_zone!("velato.wait_present_ack");
-        if !presenter.wait_for_present_ack() {
-            shutdown_trace::phase(
-                "sync_present_and_drain",
-                "present ack channel closed (TID_PRESENT exited)",
-            );
-            return false;
+    let drain = drain_commands_without_resize(cmd_rx, surface_or_pool, input, stats);
+    match drain {
+        DrainResult::Shutdown => return false,
+        DrainResult::SurfaceDirty => {
+            if *present_in_flight {
+                let _tz = goldy::tracy_zone!("velato.wait_present_ack");
+                if !presenter.wait_for_present_ack() {
+                    shutdown_trace::phase(
+                        "sync_present_and_drain",
+                        "present ack channel closed (TID_PRESENT exited)",
+                    );
+                    return false;
+                }
+                *present_in_flight = false;
+            }
+            apply_deferred_surface_resize(surface_or_pool, input)
         }
-        *present_in_flight = false;
+        DrainResult::Idle => {
+            // Scheme backend defers the present-ack wait to the pre-acquire barrier
+            // inside `submit_to_swapchain_with` (after upload submit, before the
+            // worker acquire) so upload recording/submit overlaps the previous
+            // frame's present. Classic must still gate the acquire here.
+            let is_scheme = matches!(surface_or_pool, Some(SurfaceOrPool::Scheme(_)));
+            if *present_in_flight && !is_scheme {
+                let _tz = goldy::tracy_zone!("velato.wait_present_ack");
+                if !presenter.wait_for_present_ack() {
+                    shutdown_trace::phase(
+                        "sync_present_and_drain",
+                        "present ack channel closed (TID_PRESENT exited)",
+                    );
+                    return false;
+                }
+                *present_in_flight = false;
+            }
+            true
+        }
     }
-    drain_commands(cmd_rx, surface_or_pool, input, stats)
 }
 
 /// Returns the stashed `PreparedFrame` when its dimensions still match the
@@ -1273,10 +1340,49 @@ fn try_submit_to_swapchain(
     prepared: ekrano::PreparedFrame,
     pool: &goldy::SwapchainPool,
     device_lost: &std::sync::atomic::AtomicBool,
+    presenter: &Presenter,
+    present_in_flight: &mut bool,
 ) -> RenderStep<(ekrano::FrameStats, ekrano::PresentToken)> {
-    match renderer.submit_to_swapchain(prepared, pool) {
-        Ok(result) => RenderStep::Ok(result),
+    use std::cell::Cell;
+
+    // The present-ack wait is deferred to the pre-acquire barrier: it fires inside
+    // `submit_to_swapchain_with` after the upload is submitted and right before the
+    // worker acquires its drawable. `acked` records that the barrier ran (so we can
+    // clear `present_in_flight`); `ack_closed` distinguishes a TID_PRESENT exit
+    // (Shutdown) from an ordinary submit error.
+    let needs_wait = *present_in_flight;
+    let acked = Cell::new(false);
+    let ack_closed = Cell::new(false);
+
+    let result = {
+        let acked = &acked;
+        let ack_closed = &ack_closed;
+        renderer.submit_to_swapchain_with(prepared, pool, move || {
+            if needs_wait {
+                let _tz = goldy::tracy_zone!("velato.wait_present_ack");
+                if !presenter.wait_for_present_ack() {
+                    ack_closed.set(true);
+                    return Err(ekrano::Error::Shader(
+                        "present ack channel closed (TID_PRESENT exited)".into(),
+                    ));
+                }
+            }
+            acked.set(true);
+            Ok(())
+        })
+    };
+
+    if acked.get() {
+        *present_in_flight = false;
+    }
+
+    match result {
+        Ok(r) => RenderStep::Ok(r),
         Err(e) => {
+            if ack_closed.get() {
+                shutdown_trace::phase("try_submit_to_swapchain", "present ack channel closed");
+                return RenderStep::Shutdown;
+            }
             eprintln!("submit_to_swapchain error: {e}");
             if is_device_lost_error(&e) {
                 device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1441,7 +1547,14 @@ fn ekrano_render_thread(
                     SurfaceOrPool::Scheme(p) => p,
                     _ => unreachable!(),
                 };
-                let submit = try_submit_to_swapchain(&mut renderer, prepared, pool_ref, &device_lost);
+                let submit = try_submit_to_swapchain(
+                    &mut renderer,
+                    prepared,
+                    pool_ref,
+                    &device_lost,
+                    &presenter,
+                    &mut present_in_flight,
+                );
                 match submit {
                     RenderStep::Ok(r) => (frame_stats, present_token) = r,
                     RenderStep::SkipFrame => {
@@ -1914,6 +2027,8 @@ pub fn main() -> Result<()> {
     // for FPS comparisons against upstream vello. Goldy / ekrano startup
     // tracing and per-frame perf heartbeats are still reachable via
     // `RUST_LOG=goldy=info,ekrano=debug` or similar.
+    // Scheme retention diagnosis: `RUST_LOG=goldy::scheme=debug`.
+    // Worker retention diagnosis: `RUST_LOG=ekrano=debug` (look for `[WORKER-STALE]`).
     // Shutdown stall diagnosis: `RUST_LOG=velato::shutdown=info`.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
