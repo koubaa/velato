@@ -722,6 +722,13 @@ fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()
 /// (Scheme path) so both can flow through the same command channel.
 ///
 /// Deleted with the Classic (TaskGraph) backend in Phase 6.
+///
+/// Scheme present pipeline depth: one drawable may be in-flight for async present
+/// while [`goldy::PresentGrant::consume`] speculatively acquires the next drawable
+/// for the following submit on TID_PRESENT.
+#[cfg(feature = "use_ekrano")]
+const SCHEME_PRESENT_PIPELINE_DEPTH: u32 = 2;
+
 #[cfg(feature = "use_ekrano")]
 enum SurfaceOrPool {
     Classic(goldy::Surface),
@@ -1394,6 +1401,42 @@ fn try_submit_to_swapchain(
     }
 }
 
+/// Build scene/params for the next frame's overlap path (CPU scene construction only).
+#[cfg(feature = "use_ekrano")]
+fn build_overlap_scene_params(
+    scene: &mut ekrano::Scene,
+    fragment: &mut ekrano::Scene,
+    scenes: &mut SceneSet,
+    input: &InputState,
+    simple_text: &mut RobotoText,
+    stats: &Arc<std::sync::Mutex<stats::Stats>>,
+    base_color: Option<Color>,
+) -> ekrano::RenderParams {
+    let _tz = goldy::tracy_zone!("velato.build_scene_overlap");
+    let stats_guard = stats.lock().expect("stats mutex poisoned");
+    let params = build_ekrano_scene(
+        scene,
+        fragment,
+        scenes,
+        input,
+        simple_text,
+        &stats_guard,
+        base_color,
+    );
+    params
+}
+
+/// Run phase-1 `ekrano.prepare` for a scene already built by [`build_overlap_scene_params`].
+#[cfg(feature = "use_ekrano")]
+fn overlap_prepare_from_params(
+    renderer: &mut ekrano::GoldyRenderer,
+    scene: &ekrano::Scene,
+    overlap_params: &ekrano::RenderParams,
+) -> Option<ekrano::PreparedFrame> {
+    let _tz = goldy::tracy_zone!("velato.overlap_prepare");
+    renderer.prepare(scene, overlap_params).ok()
+}
+
 /// Speculatively builds the *next* frame's `PreparedFrame` while `TID_PRESENT`
 /// is busy calling `swapchain.Present()` for the frame just submitted.
 ///
@@ -1410,21 +1453,16 @@ fn build_overlap_stash(
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
     base_color: Option<Color>,
 ) -> Option<ekrano::PreparedFrame> {
-    let _tz = goldy::tracy_zone!("velato.overlap_prepare");
-    let overlap_params = {
-        let _tz = goldy::tracy_zone!("velato.build_scene_overlap");
-        let stats_guard = stats.lock().expect("stats mutex poisoned");
-        build_ekrano_scene(
-            scene,
-            fragment,
-            scenes,
-            input,
-            simple_text,
-            &stats_guard,
-            base_color,
-        )
-    };
-    renderer.prepare(scene, &overlap_params).ok()
+    let overlap_params = build_overlap_scene_params(
+        scene,
+        fragment,
+        scenes,
+        input,
+        simple_text,
+        stats,
+        base_color,
+    );
+    overlap_prepare_from_params(renderer, scene, &overlap_params)
 }
 
 // ---------------------------------------------------------------------------
@@ -1578,16 +1616,9 @@ fn ekrano_render_thread(
                     frame_stats.bump_retries,
                 );
             }
-            if !presenter.send_present_token(present_token, &device_lost) {
-                shutdown_trace::phase("render_loop", "present channel closed");
-                break;
-            }
-            present_in_flight = true;
-
-            // Phase 4 — Overlap: build the next frame's scene on the CPU while
-            // TID_PRESENT presents the frame just submitted.
-            stash = build_overlap_stash(
-                &mut renderer,
+            // Build next frame's scene before waking TID_PRESENT so scene CPU work
+            // can overlap the previous frame's present round-trip.
+            let overlap_params = build_overlap_scene_params(
                 &mut scene,
                 &mut fragment,
                 &mut scenes,
@@ -1596,6 +1627,15 @@ fn ekrano_render_thread(
                 &stats,
                 base_color,
             );
+            if !presenter.send_present_token(present_token, &device_lost) {
+                shutdown_trace::phase("render_loop", "present channel closed");
+                break;
+            }
+            present_in_flight = true;
+
+            // Phase 4 — `ekrano.prepare` for the next frame while TID_PRESENT
+            // presents the frame just submitted and speculatively acquires the next drawable.
+            stash = overlap_prepare_from_params(&mut renderer, &scene, &overlap_params);
         } else {
             // Classic path.
             let (frame_stats, frame): (ekrano::FrameStats, goldy::Frame);
@@ -1677,7 +1717,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     use ekrano::GoldyRenderer;
     use goldy::{
         DeviceDescriptor, Instance, PresentMode, RequestAdapterOptions, Surface, SurfaceConfig,
-        SwapchainPool,
+        SwapchainPool, SwapchainPoolOptions,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Sender};
@@ -1964,11 +2004,14 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                         SurfaceOrPool::Classic(surf)
                     }
                     ekrano::GoldyBackend::Scheme => {
-                        let pool = SwapchainPool::new_with_config(
+                        let pool = SwapchainPool::new_with_options(
                             &render_ctx,
                             win.as_ref(),
-                            1,
-                            config,
+                            SwapchainPoolOptions {
+                                depth: SCHEME_PRESENT_PIPELINE_DEPTH,
+                                config,
+                                speculative_acquire: true,
+                            },
                         )
                         .expect("Failed to create goldy swapchain pool");
                         SurfaceOrPool::Scheme(pool)
