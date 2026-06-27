@@ -723,11 +723,36 @@ fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()
 ///
 /// Deleted with the Classic (TaskGraph) backend in Phase 6.
 ///
-/// Scheme present pipeline depth: one drawable may be in-flight for async present
-/// while [`goldy::PresentGrant::consume`] speculatively acquires the next drawable
-/// for the following submit on TID_PRESENT.
+/// Scheme present pipeline depth and speculative-acquire policy depend on the
+/// backend:
+///
+/// - **Metal**: depth=2, speculative_acquire=true. `CAMetalLayer` hands drawables
+///   out from a pool so two in-flight is safe; speculative acquire after present
+///   lets the render thread avoid a synchronous drawable wait.
+/// - **Vulkan / DX12**: depth=1, speculative_acquire=false. Both use a flip-model
+///   swapchain with a fixed back-buffer ring. Acquiring speculatively before the
+///   previous present has rotated `GetCurrentBackBufferIndex` (DX12) or the image
+///   has been released (Vulkan) produces an ACQUIRE RACE and exhausts the depth
+///   gate immediately.
 #[cfg(feature = "use_ekrano")]
-const SCHEME_PRESENT_PIPELINE_DEPTH: u32 = 2;
+fn scheme_pool_options(
+    backend_type: goldy::BackendType,
+    config: goldy::SurfaceConfig,
+) -> goldy::SwapchainPoolOptions {
+    if backend_type == goldy::BackendType::Metal {
+        goldy::SwapchainPoolOptions {
+            depth: 2,
+            config,
+            speculative_acquire: true,
+        }
+    } else {
+        goldy::SwapchainPoolOptions {
+            depth: 1,
+            config,
+            speculative_acquire: false,
+        }
+    }
+}
 
 #[cfg(feature = "use_ekrano")]
 enum SurfaceOrPool {
@@ -1352,17 +1377,17 @@ fn try_submit_to_swapchain(
 ) -> RenderStep<(ekrano::FrameStats, ekrano::PresentToken)> {
     use std::cell::Cell;
 
-    // The present-ack wait is deferred to the pre-acquire barrier: it fires inside
-    // `submit_to_swapchain_with` after the upload is submitted and right before the
-    // worker acquires its drawable. `acked` records that the barrier ran (so we can
-    // clear `present_in_flight`); `ack_closed` distinguishes a TID_PRESENT exit
-    // (Shutdown) from an ordinary submit error.
+    // Present-ack wait is deferred to pre_acquire (after upload submit, before worker
+    // acquire) so upload recording/submit overlaps the previous frame's present.
+    // Flip-model backends (DX12/Vulkan) also require wait_for_acquire_capacity: present
+    // ack fires before the return fence retires and pending_acquire_count drops.
     let needs_wait = *present_in_flight;
-    let acked = Cell::new(false);
+    let consumed_present_ack = Cell::new(false);
     let ack_closed = Cell::new(false);
+    let ctx = renderer.submission_context();
 
     let result = {
-        let acked = &acked;
+        let consumed_present_ack = &consumed_present_ack;
         let ack_closed = &ack_closed;
         renderer.submit_to_swapchain_with(prepared, pool, move || {
             if needs_wait {
@@ -1373,13 +1398,14 @@ fn try_submit_to_swapchain(
                         "present ack channel closed (TID_PRESENT exited)".into(),
                     ));
                 }
+                consumed_present_ack.set(true);
             }
-            acked.set(true);
+            pool.wait_for_acquire_capacity(&ctx);
             Ok(())
         })
     };
 
-    if acked.get() {
+    if consumed_present_ack.get() {
         *present_in_flight = false;
     }
 
@@ -1595,15 +1621,7 @@ fn ekrano_render_thread(
                 );
                 match submit {
                     RenderStep::Ok(r) => (frame_stats, present_token) = r,
-                    RenderStep::SkipFrame => {
-                        // NLL ends the pool_ref borrow at the last use above; reborrow is safe.
-                        if let Some(SurfaceOrPool::Scheme(p)) = surface_or_pool.as_ref() {
-                            let _ = p.resize(input.width, input.height);
-                            input.width = p.width();
-                            input.height = p.height();
-                        }
-                        continue;
-                    }
+                    RenderStep::SkipFrame => continue,
                     RenderStep::Shutdown => {
                         shutdown_trace::phase("render_loop", "submit failed (device lost)");
                         break;
@@ -1717,7 +1735,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     use ekrano::GoldyRenderer;
     use goldy::{
         DeviceDescriptor, Instance, PresentMode, RequestAdapterOptions, Surface, SurfaceConfig,
-        SwapchainPool, SwapchainPoolOptions,
+        SwapchainPool,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Sender};
@@ -2007,11 +2025,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                         let pool = SwapchainPool::new_with_options(
                             &render_ctx,
                             win.as_ref(),
-                            SwapchainPoolOptions {
-                                depth: SCHEME_PRESENT_PIPELINE_DEPTH,
-                                config,
-                                speculative_acquire: true,
-                            },
+                            scheme_pool_options(device.backend_type(), config),
                         )
                         .expect("Failed to create goldy swapchain pool");
                         SurfaceOrPool::Scheme(pool)
