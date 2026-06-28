@@ -16,8 +16,13 @@
     clippy::allow_attributes,
     clippy::allow_attributes_without_reason
 )]
-
 use instant::Instant;
+
+#[cfg(all(feature = "use_vello", feature = "use_ekrano"))]
+compile_error!(
+    "Enable only one renderer backend: default for vello, or \
+     `--no-default-features --features use_ekrano` for ekrano"
+);
 #[cfg(feature = "use_vello")]
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -636,7 +641,7 @@ fn dump_backend_info(backend: &str) {
 
 /// # Panics
 /// Can panic.
-#[cfg(feature = "use_vello")]
+#[cfg(all(feature = "use_vello", not(feature = "use_ekrano")))]
 pub fn main() -> Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();

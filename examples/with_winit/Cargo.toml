@@ -23,7 +23,9 @@ workspace = true
 default = ["use_vello"]
 use_vello = ["dep:vello", "dep:wgpu", "scenes/use_vello"]
 use_ekrano = ["dep:ekrano", "dep:goldy", "scenes/use_ekrano"]
-tracy = ["use_ekrano", "ekrano/tracy", "goldy/tracy"]
+# Tracy is ekrano/goldy-only; do not pull in `use_ekrano` here or it conflicts with
+# the default `use_vello` backend. Use `--no-default-features --features use_ekrano,tracy`.
+tracy = ["ekrano/tracy", "goldy/tracy"]
 
 [dependencies]
 vello = { workspace = true, features = ["wgpu"], optional = true }
