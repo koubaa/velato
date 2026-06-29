@@ -804,6 +804,12 @@ fn is_device_lost_error(err: &impl std::fmt::Display) -> bool {
 }
 
 #[cfg(feature = "use_ekrano")]
+fn is_swapchain_out_of_date_error(err: &impl std::fmt::Display) -> bool {
+    let s = err.to_string();
+    s.contains("out of date") || s.contains("OUT_OF_DATE")
+}
+
+#[cfg(feature = "use_ekrano")]
 fn apply_render_cmd(
     cmd: RenderCmd,
     surface_or_pool: &mut Option<SurfaceOrPool>,
@@ -879,21 +885,6 @@ fn apply_render_cmd(
 }
 
 #[cfg(feature = "use_ekrano")]
-fn drain_commands(
-    cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
-    surface_or_pool: &mut Option<SurfaceOrPool>,
-    input: &mut InputState,
-    stats: &Arc<std::sync::Mutex<stats::Stats>>,
-) -> bool {
-    let surface_dirty = drain_commands_without_resize(cmd_rx, surface_or_pool, input, stats);
-    match surface_dirty {
-        DrainResult::Shutdown => false,
-        DrainResult::Idle => true,
-        DrainResult::SurfaceDirty => apply_deferred_surface_resize(surface_or_pool, input),
-    }
-}
-
-#[cfg(feature = "use_ekrano")]
 enum DrainResult {
     Shutdown,
     Idle,
@@ -935,8 +926,78 @@ fn drain_commands_without_resize(
     }
 }
 
+/// Rebuild the scheme swapchain at the latest requested dimensions.
+///
+/// Used both proactively on [`DrainResult::SurfaceDirty`] (after present ack) and
+/// reactively when submit/acquire reports OUT_OF_DATE.
 #[cfg(feature = "use_ekrano")]
-fn apply_deferred_surface_resize(surface_or_pool: &mut Option<SurfaceOrPool>, input: &mut InputState) -> bool {
+fn scheme_swapchain_resize(
+    surface_or_pool: &mut Option<SurfaceOrPool>,
+    input: &mut InputState,
+    renderer: &mut ekrano::GoldyRenderer,
+    device_lost: &std::sync::atomic::AtomicBool,
+    reason: &str,
+) -> bool {
+    let Some(SurfaceOrPool::Scheme(p)) = surface_or_pool.as_mut() else {
+        return true;
+    };
+    match p.resize(input.width, input.height) {
+        Ok(()) => {
+            input.width = p.width();
+            input.height = p.height();
+            renderer.invalidate_swapchain_retention();
+            true
+        }
+        Err(e) => {
+            if reason == "reactive" {
+                eprintln!("reactive scheme resize error: {e}");
+            }
+            if is_device_lost_error(&e) {
+                device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        }
+    }
+}
+
+/// Rebuild the scheme swapchain after Vulkan reports OUT_OF_DATE. Waits for the
+/// in-flight present round-trip first so FIFO scheduled presents finish before
+/// swapchain recreation.
+#[cfg(feature = "use_ekrano")]
+fn reactive_scheme_resize(
+    surface_or_pool: &mut Option<SurfaceOrPool>,
+    input: &mut InputState,
+    present_in_flight: &mut bool,
+    presenter: &Presenter,
+    device_lost: &std::sync::atomic::AtomicBool,
+    renderer: &mut ekrano::GoldyRenderer,
+) -> bool {
+    if *present_in_flight {
+        let _tz = goldy::tracy_zone!("velato.wait_present_ack");
+        if !presenter.wait_for_present_ack() {
+            shutdown_trace::phase("reactive_scheme_resize", "present ack channel closed");
+            return false;
+        }
+        *present_in_flight = false;
+    }
+    scheme_swapchain_resize(
+        surface_or_pool,
+        input,
+        renderer,
+        device_lost,
+        "reactive",
+    )
+}
+
+#[cfg(feature = "use_ekrano")]
+fn apply_deferred_surface_resize(
+    surface_or_pool: &mut Option<SurfaceOrPool>,
+    input: &mut InputState,
+    renderer: &mut ekrano::GoldyRenderer,
+    device_lost: &std::sync::atomic::AtomicBool,
+) -> bool {
     // A present-mode change (ToggleVsync) requires an immediate swapchain rebuild before
     // the next frame. The surface/pool may clamp the requested dimensions to its capability
     // limits, so sync input.width/height to the real swapchain afterwards.
@@ -945,20 +1006,24 @@ fn apply_deferred_surface_resize(surface_or_pool: &mut Option<SurfaceOrPool>, in
             let _ = s.resize(input.width, input.height);
             input.width = s.width();
             input.height = s.height();
+            true
         }
-        Some(SurfaceOrPool::Scheme(p)) => {
-            let before = (input.width, input.height);
-            let _ = p.resize(input.width, input.height);
-            input.width = p.width();
-            input.height = p.height();
-            eprintln!(
-                "[velato] deferred resize: {}x{} -> {}x{}",
-                before.0, before.1, input.width, input.height
-            );
+        Some(SurfaceOrPool::Scheme(_)) => {
+            scheme_swapchain_resize(surface_or_pool, input, renderer, device_lost, "proactive")
         }
-        None => {}
+        None => true,
     }
-    true
+}
+
+#[cfg(feature = "use_ekrano")]
+fn scheme_render_dimensions(
+    surface_or_pool: Option<&SurfaceOrPool>,
+    input: &InputState,
+) -> (u32, u32) {
+    match surface_or_pool {
+        Some(SurfaceOrPool::Scheme(p)) => (p.width(), p.height()),
+        _ => (input.width, input.height),
+    }
 }
 
 #[cfg(feature = "use_ekrano")]
@@ -970,6 +1035,8 @@ fn build_ekrano_scene(
     simple_text: &mut RobotoText,
     stats: &stats::Stats,
     base_color: Option<Color>,
+    render_width: u32,
+    render_height: u32,
 ) -> ekrano::RenderParams {
     use ekrano::RenderParams;
 
@@ -991,8 +1058,8 @@ fn build_ekrano_scene(
         .unwrap_or(Color::BLACK);
     let render_params = RenderParams {
         base_color: resolved_base_color,
-        width: input.width,
-        height: input.height,
+        width: render_width,
+        height: render_height,
         antialiasing_method: ekrano::AaConfig::Area,
         robust: false,
     };
@@ -1184,7 +1251,10 @@ enum RenderStep<T> {
     /// Step produced a value; processing continues normally.
     Ok(T),
     /// Transient failure (e.g. prepare error); skip this frame and retry.
-    SkipFrame,
+    SkipFrame {
+        /// When true, the swapchain should be rebuilt at the latest requested size.
+        out_of_date: bool,
+    },
     /// Fatal condition (device lost or channel closed); exit the render loop.
     Shutdown,
 }
@@ -1250,6 +1320,9 @@ fn sync_present_and_drain(
     surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
+    renderer: &mut ekrano::GoldyRenderer,
+    device_lost: &std::sync::atomic::AtomicBool,
+    scheme_stash_clear: &mut bool,
 ) -> bool {
     let drain = drain_commands_without_resize(cmd_rx, surface_or_pool, input, stats);
     match drain {
@@ -1266,7 +1339,10 @@ fn sync_present_and_drain(
                 }
                 *present_in_flight = false;
             }
-            apply_deferred_surface_resize(surface_or_pool, input)
+            if matches!(surface_or_pool, Some(SurfaceOrPool::Scheme(_))) {
+                *scheme_stash_clear = true;
+            }
+            apply_deferred_surface_resize(surface_or_pool, input, renderer, device_lost)
         }
         DrainResult::Idle => {
             // Scheme backend defers the present-ack wait to the pre-acquire barrier
@@ -1307,9 +1383,11 @@ fn take_stash_or_rebuild(
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
     base_color: Option<Color>,
     device_lost: &std::sync::atomic::AtomicBool,
+    render_width: u32,
+    render_height: u32,
 ) -> RenderStep<ekrano::PreparedFrame> {
     if let Some(prepared) = stash {
-        if prepared.width() == input.width && prepared.height() == input.height {
+        if prepared.width() == render_width && prepared.height() == render_height {
             return RenderStep::Ok(prepared);
         }
     }
@@ -1324,6 +1402,8 @@ fn take_stash_or_rebuild(
             simple_text,
             &stats_guard,
             base_color,
+            render_width,
+            render_height,
         )
     };
     match renderer.prepare(scene, &render_params) {
@@ -1334,7 +1414,7 @@ fn take_stash_or_rebuild(
                 device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
                 RenderStep::Shutdown
             } else {
-                RenderStep::SkipFrame
+                RenderStep::SkipFrame { out_of_date: false }
             }
         }
     }
@@ -1360,7 +1440,9 @@ fn try_submit_prepared(
                 device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
                 RenderStep::Shutdown
             } else {
-                RenderStep::SkipFrame
+                RenderStep::SkipFrame {
+                    out_of_date: is_swapchain_out_of_date_error(&e),
+                }
             }
         }
     }
@@ -1421,12 +1503,15 @@ fn try_submit_to_swapchain(
                 shutdown_trace::phase("try_submit_to_swapchain", "present ack channel closed");
                 return RenderStep::Shutdown;
             }
-            eprintln!("submit_to_swapchain error: {e}");
             if is_device_lost_error(&e) {
+                eprintln!("submit_to_swapchain error: {e}");
                 device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
                 RenderStep::Shutdown
+            } else if is_swapchain_out_of_date_error(&e) {
+                RenderStep::SkipFrame { out_of_date: true }
             } else {
-                RenderStep::SkipFrame
+                eprintln!("submit_to_swapchain error: {e}");
+                RenderStep::SkipFrame { out_of_date: false }
             }
         }
     }
@@ -1442,6 +1527,8 @@ fn build_overlap_scene_params(
     simple_text: &mut RobotoText,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
     base_color: Option<Color>,
+    render_width: u32,
+    render_height: u32,
 ) -> ekrano::RenderParams {
     let _tz = goldy::tracy_zone!("velato.build_scene_overlap");
     let stats_guard = stats.lock().expect("stats mutex poisoned");
@@ -1453,6 +1540,8 @@ fn build_overlap_scene_params(
         simple_text,
         &stats_guard,
         base_color,
+        render_width,
+        render_height,
     );
     params
 }
@@ -1483,6 +1572,8 @@ fn build_overlap_stash(
     simple_text: &mut RobotoText,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
     base_color: Option<Color>,
+    render_width: u32,
+    render_height: u32,
 ) -> Option<ekrano::PreparedFrame> {
     let overlap_params = build_overlap_scene_params(
         scene,
@@ -1492,6 +1583,8 @@ fn build_overlap_stash(
         simple_text,
         stats,
         base_color,
+        render_width,
+        render_height,
     );
     overlap_prepare_from_params(renderer, scene, &overlap_params)
 }
@@ -1551,6 +1644,7 @@ fn ekrano_render_thread(
             );
             return;
         }
+        let mut scheme_stash_clear = false;
         if !sync_present_and_drain(
             &mut present_in_flight,
             &presenter,
@@ -1558,9 +1652,15 @@ fn ekrano_render_thread(
             &mut surface_or_pool,
             &mut input,
             &stats,
+            &mut renderer,
+            &device_lost,
+            &mut scheme_stash_clear,
         ) {
             shutdown_trace::phase("render_loop", "sync_present_and_drain returned false");
             break;
+        }
+        if scheme_stash_clear {
+            stash = None;
         }
 
         if surface_or_pool.is_none() {
@@ -1579,6 +1679,9 @@ fn ekrano_render_thread(
             prev_scene_ix = scene_ix;
         }
 
+        let (render_width, render_height) =
+            scheme_render_dimensions(surface_or_pool.as_ref(), &input);
+
         // Phase 2 — Prepare: reuse the overlap stash or rebuild the scene.
         let prepared = match take_stash_or_rebuild(
             stash.take(),
@@ -1591,9 +1694,16 @@ fn ekrano_render_thread(
             &stats,
             base_color,
             &device_lost,
+            render_width,
+            render_height,
         ) {
             RenderStep::Ok(p) => p,
-            RenderStep::SkipFrame => continue,
+            RenderStep::SkipFrame { .. } => {
+                if matches!(surface_or_pool, Some(SurfaceOrPool::Scheme(_))) {
+                    stash = None;
+                }
+                continue;
+            }
             RenderStep::Shutdown => {
                 shutdown_trace::phase("render_loop", "prepare failed (device lost)");
                 break;
@@ -1626,7 +1736,24 @@ fn ekrano_render_thread(
                 );
                 match submit {
                     RenderStep::Ok(r) => (frame_stats, present_token) = r,
-                    RenderStep::SkipFrame => continue,
+                    RenderStep::SkipFrame { out_of_date: true } => {
+                        stash = None;
+                        if !reactive_scheme_resize(
+                            &mut surface_or_pool,
+                            &mut input,
+                            &mut present_in_flight,
+                            &presenter,
+                            &device_lost,
+                            &mut renderer,
+                        ) {
+                            break;
+                        }
+                        continue;
+                    }
+                    RenderStep::SkipFrame { out_of_date: false } => {
+                        stash = None;
+                        continue;
+                    }
                     RenderStep::Shutdown => {
                         shutdown_trace::phase("render_loop", "submit failed (device lost)");
                         break;
@@ -1641,6 +1768,8 @@ fn ekrano_render_thread(
             }
             // Build next frame's scene before waking TID_PRESENT so scene CPU work
             // can overlap the previous frame's present round-trip.
+            let (overlap_w, overlap_h) =
+                scheme_render_dimensions(surface_or_pool.as_ref(), &input);
             let overlap_params = build_overlap_scene_params(
                 &mut scene,
                 &mut fragment,
@@ -1649,6 +1778,8 @@ fn ekrano_render_thread(
                 &mut simple_text,
                 &stats,
                 base_color,
+                overlap_w,
+                overlap_h,
             );
             if !presenter.send_present_token(present_token, &device_lost) {
                 shutdown_trace::phase("render_loop", "present channel closed");
@@ -1670,7 +1801,7 @@ fn ekrano_render_thread(
                 let submit = try_submit_prepared(&mut renderer, prepared, surface_ref, &device_lost);
                 match submit {
                     RenderStep::Ok(r) => (frame_stats, frame) = r,
-                    RenderStep::SkipFrame => {
+                    RenderStep::SkipFrame { out_of_date: true } => {
                         // Swapchain is out of date (ERROR_OUT_OF_DATE_KHR from acquire_next_image).
                         // Rebuild it reactively at the latest requested dimensions. Doing this here
                         // — rather than proactively in drain_commands — prevents the cascade of
@@ -1687,6 +1818,7 @@ fn ekrano_render_thread(
                         }
                         continue;
                     }
+                    RenderStep::SkipFrame { out_of_date: false } => continue,
                     RenderStep::Shutdown => {
                         shutdown_trace::phase("render_loop", "submit failed (device lost)");
                         break;
@@ -1707,6 +1839,8 @@ fn ekrano_render_thread(
 
             // Phase 4 — Overlap: build the next frame's scene on the CPU while
             // TID_PRESENT calls swapchain.Present() for the frame just submitted.
+            let (overlap_w, overlap_h) =
+                scheme_render_dimensions(surface_or_pool.as_ref(), &input);
             stash = build_overlap_stash(
                 &mut renderer,
                 &mut scene,
@@ -1716,6 +1850,8 @@ fn ekrano_render_thread(
                 &mut simple_text,
                 &stats,
                 base_color,
+                overlap_w,
+                overlap_h,
             );
         }
 
