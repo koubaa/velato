@@ -731,31 +731,31 @@ fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()
 /// Scheme present pipeline depth and speculative-acquire policy depend on the
 /// backend:
 ///
-/// - **Metal**: depth=2, speculative_acquire=true. `CAMetalLayer` hands drawables
-///   out from a pool so two in-flight is safe; speculative acquire after present
-///   lets the render thread avoid a synchronous drawable wait.
-/// - **Vulkan / DX12**: depth=1, speculative_acquire=false. Both use a flip-model
-///   swapchain with a fixed back-buffer ring. Acquiring speculatively before the
-///   previous present has rotated `GetCurrentBackBufferIndex` (DX12) or the image
-///   has been released (Vulkan) produces an ACQUIRE RACE and exhausts the depth
-///   gate immediately.
+/// - **Metal / DX12**: depth=2, speculative_acquire=true. Two in-flight drawables
+///   match the physical swapchain ring (`MAX_FRAMES_IN_FLIGHT = 2` on DX12).
+///   Speculative acquire after present lets the render thread avoid a synchronous
+///   drawable wait. On DX12 this is safe because FIFO scheduled present on the
+///   submission worker blocks until `IDXGISwapChain3::Present` returns before
+///   speculative acquire calls `GetCurrentBackBufferIndex`.
+/// - **Vulkan**: depth=1, speculative_acquire=false. Flip-model acquire before
+///   the previous present has released the image produces an ACQUIRE RACE and
+///   exhausts the depth gate immediately.
 #[cfg(feature = "use_ekrano")]
 fn scheme_pool_options(
     backend_type: goldy::BackendType,
     config: goldy::SurfaceConfig,
 ) -> goldy::SwapchainPoolOptions {
-    if backend_type == goldy::BackendType::Metal {
-        goldy::SwapchainPoolOptions {
+    match backend_type {
+        goldy::BackendType::Metal | goldy::BackendType::Dx12 => goldy::SwapchainPoolOptions {
             depth: 2,
             config,
             speculative_acquire: true,
-        }
-    } else {
-        goldy::SwapchainPoolOptions {
+        },
+        goldy::BackendType::Vulkan => goldy::SwapchainPoolOptions {
             depth: 1,
             config,
             speculative_acquire: false,
-        }
+        },
     }
 }
 
@@ -935,12 +935,14 @@ fn scheme_swapchain_resize(
     surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     renderer: &mut ekrano::GoldyRenderer,
+    ctx: &goldy::Context,
     device_lost: &std::sync::atomic::AtomicBool,
     reason: &str,
 ) -> bool {
     let Some(SurfaceOrPool::Scheme(p)) = surface_or_pool.as_mut() else {
         return true;
     };
+    p.sync_before_rebuild(ctx);
     match p.resize(input.width, input.height) {
         Ok(()) => {
             input.width = p.width();
@@ -986,6 +988,7 @@ fn reactive_scheme_resize(
         surface_or_pool,
         input,
         renderer,
+        &renderer.submission_context(),
         device_lost,
         "reactive",
     )
@@ -1009,7 +1012,14 @@ fn apply_deferred_surface_resize(
             true
         }
         Some(SurfaceOrPool::Scheme(_)) => {
-            scheme_swapchain_resize(surface_or_pool, input, renderer, device_lost, "proactive")
+            scheme_swapchain_resize(
+                surface_or_pool,
+                input,
+                renderer,
+                &renderer.submission_context(),
+                device_lost,
+                "proactive",
+            )
         }
         None => true,
     }
