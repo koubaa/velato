@@ -931,14 +931,20 @@ fn reactive_scheme_resize(
     surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     present_in_flight: &mut bool,
+    present_sent_seq: u64,
     presenter: &Presenter,
     device_lost: &std::sync::atomic::AtomicBool,
     renderer: &mut ekrano::GoldyRenderer,
 ) -> bool {
     if *present_in_flight {
-        let _tz = goldy::tracy_zone!("velato.wait_present_ack");
-        if !presenter.wait_for_present_ack() {
-            return false;
+        if let Some(SurfaceOrPool::Scheme(pool)) = surface_or_pool.as_ref() {
+            let _tz = goldy::tracy_zone!("velato.wait_present_completed");
+            pool.wait_present_completed(present_sent_seq);
+        } else {
+            let _tz = goldy::tracy_zone!("velato.wait_present_ack");
+            if !presenter.wait_for_present_ack() {
+                return false;
+            }
         }
         *present_in_flight = false;
     }
@@ -1102,19 +1108,10 @@ impl Presenter {
                             let _ = ack_tx.send(());
                             err
                         }
-                        PresentPayload::Scheme(token) => match token.present_scanout_and_grant() {
-                            Ok(grant) => {
-                                // Ack after scanout (consume) but before speculative acquire so
-                                // resize/rebuild is not blocked behind swapchain capacity waits.
-                                let _ = ack_tx.send(());
-                                grant.speculate_next_acquire_after_present();
-                                None
-                            }
-                            Err(e) => {
-                                let _ = ack_tx.send(());
-                                Some(e.to_string())
-                            }
-                        },
+                        // Scheme path: lifecycle is pool counters (present_began / present_completed).
+                        // Do not send on ack_tx — velato no longer drains it on this path and a
+                        // capacity-1 sync_channel would wedge TID_PRESENT after the second frame.
+                        PresentPayload::Scheme(token) => token.present_scanout().err().map(|e| e.to_string()),
                     };
                     if let Some(e) = present_err {
                         eprintln!("present error (TID_PRESENT): {e}");
@@ -1284,6 +1281,7 @@ fn block_until_surface(
 #[cfg(feature = "use_ekrano")]
 fn sync_present_and_drain(
     present_in_flight: &mut bool,
+    present_sent_seq: u64,
     presenter: &Presenter,
     cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
     surface_or_pool: &mut Option<SurfaceOrPool>,
@@ -1298,9 +1296,14 @@ fn sync_present_and_drain(
         DrainResult::Shutdown => return false,
         DrainResult::SurfaceDirty => {
             if *present_in_flight {
-                let _tz = goldy::tracy_zone!("velato.wait_present_ack");
-                if !presenter.wait_for_present_ack() {
-                    return false;
+                if let Some(SurfaceOrPool::Scheme(pool)) = surface_or_pool.as_ref() {
+                    let _tz = goldy::tracy_zone!("velato.wait_present_completed");
+                    pool.wait_present_completed(present_sent_seq);
+                } else {
+                    let _tz = goldy::tracy_zone!("velato.wait_present_ack");
+                    if !presenter.wait_for_present_ack() {
+                        return false;
+                    }
                 }
                 *present_in_flight = false;
             }
@@ -1420,48 +1423,40 @@ fn try_submit_to_swapchain(
     prepared: ekrano::PreparedFrame,
     pool: &goldy::SwapchainPool,
     device_lost: &std::sync::atomic::AtomicBool,
-    presenter: &Presenter,
+    _presenter: &Presenter,
     present_in_flight: &mut bool,
+    present_sent_seq: u64,
 ) -> RenderStep<(ekrano::FrameStats, ekrano::PresentToken)> {
     use std::cell::Cell;
 
-    // Present-ack wait runs in pre_acquire before worker submit so upload recording
-    // overlaps the previous frame's present. Capacity wait stays here as backpressure
-    // when the speculative stash is empty; with a healthy stash it is usually a no-op.
+    // Present-began wait runs in pre_acquire before upload/worker submit so staging
+    // recording overlaps the previous frame's present. Capacity wait stays here as backpressure
+    // when the early-acquire stash is empty.
     let needs_wait = *present_in_flight;
-    let consumed_present_ack = Cell::new(false);
-    let ack_closed = Cell::new(false);
+    let consumed_present_began = Cell::new(false);
     let ctx = renderer.submission_context();
+    let wait_seq = present_sent_seq;
 
     let result = {
-        let consumed_present_ack = &consumed_present_ack;
-        let ack_closed = &ack_closed;
+        let consumed_present_began = &consumed_present_began;
         renderer.submit_to_swapchain_with(prepared, pool, move || {
             if needs_wait {
-                let _tz = goldy::tracy_zone!("velato.wait_present_ack");
-                if !presenter.wait_for_present_ack() {
-                    ack_closed.set(true);
-                    return Err(ekrano::Error::Shader(
-                        "present ack channel closed (TID_PRESENT exited)".into(),
-                    ));
-                }
-                consumed_present_ack.set(true);
+                let _tz = goldy::tracy_zone!("velato.wait_present_began");
+                pool.wait_present_began(wait_seq);
+                consumed_present_began.set(true);
             }
             pool.wait_for_acquire_capacity(&ctx);
             Ok(())
         })
     };
 
-    if consumed_present_ack.get() {
+    if consumed_present_began.get() {
         *present_in_flight = false;
     }
 
     match result {
         Ok(r) => RenderStep::Ok(r),
         Err(e) => {
-            if ack_closed.get() {
-                return RenderStep::Shutdown;
-            }
             if is_device_lost_error(&e) {
                 eprintln!("submit_to_swapchain error: {e}");
                 device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1583,6 +1578,7 @@ let start = Instant::now();
     let mut frame_start_time = Instant::now();
     let presenter = Presenter::new(Arc::clone(&device_lost));
     let mut present_in_flight = false;
+    let mut present_sent_seq: u64 = 0;
     let mut surface_or_pool: Option<SurfaceOrPool> = None;
 
     loop {
@@ -1598,6 +1594,7 @@ return;
         let mut scheme_stash_clear = false;
         if !sync_present_and_drain(
             &mut present_in_flight,
+            present_sent_seq,
             &presenter,
             &cmd_rx,
             &mut surface_or_pool,
@@ -1675,6 +1672,10 @@ break;
                     SurfaceOrPool::Scheme(p) => p,
                     _ => unreachable!(),
                 };
+                {
+                    let _tz = goldy::tracy_zone!("velato.early_acquire");
+                    let _ = pool_ref.try_early_acquire(present_sent_seq);
+                }
                 let submit = try_submit_to_swapchain(
                     &mut renderer,
                     prepared,
@@ -1682,6 +1683,7 @@ break;
                     &device_lost,
                     &presenter,
                     &mut present_in_flight,
+                    present_sent_seq,
                 );
                 match submit {
                     RenderStep::Ok(r) => (frame_stats, present_token) = r,
@@ -1691,6 +1693,7 @@ break;
                             &mut surface_or_pool,
                             &mut input,
                             &mut present_in_flight,
+                            present_sent_seq,
                             &presenter,
                             &device_lost,
                             &mut renderer,
@@ -1732,6 +1735,7 @@ break;
             if !presenter.send_present_token(present_token, &device_lost) {
 break;
             }
+            present_sent_seq += 1;
             present_in_flight = true;
 
             // Phase 4 — `ekrano.prepare` for the next frame while TID_PRESENT
