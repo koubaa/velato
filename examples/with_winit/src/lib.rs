@@ -671,43 +671,6 @@ pub fn main() -> Result<()> {
 // Ekrano backend
 // ---------------------------------------------------------------------------
 
-/// Timestamped shutdown tracing (`RUST_LOG=velato::shutdown=info`).
-#[cfg(feature = "use_ekrano")]
-mod shutdown_trace {
-    use instant::Instant;
-    use std::sync::OnceLock;
-
-    static APP_START: OnceLock<Instant> = OnceLock::new();
-    static SHUTDOWN_START: OnceLock<Instant> = OnceLock::new();
-
-    fn app_start() -> Instant {
-        *APP_START.get_or_init(Instant::now)
-    }
-
-    pub(super) fn mark_initiated(reason: &str) {
-        let shutdown_start = *SHUTDOWN_START.get_or_init(Instant::now);
-        tracing::info!(
-            target: "velato::shutdown",
-            reason,
-            app_elapsed_ms = app_start().elapsed().as_millis() as u64,
-            shutdown_elapsed_ms = shutdown_start.elapsed().as_millis() as u64,
-            "shutdown initiated"
-        );
-    }
-
-    pub(super) fn phase(phase: &str, detail: &str) {
-        tracing::info!(
-            target: "velato::shutdown",
-            phase,
-            detail,
-            app_elapsed_ms = app_start().elapsed().as_millis() as u64,
-            shutdown_elapsed_ms = SHUTDOWN_START
-                .get()
-                .map(|t| t.elapsed().as_millis() as u64),
-            "shutdown phase"
-        );
-    }
-}
 
 #[cfg(feature = "use_ekrano")]
 fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()>) -> Arc<Window> {
@@ -731,12 +694,11 @@ fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()
 /// Scheme present pipeline depth and speculative-acquire policy depend on the
 /// backend:
 ///
-/// - **Metal / DX12**: depth=2, speculative_acquire=true. Two in-flight drawables
-///   match the physical swapchain ring (`MAX_FRAMES_IN_FLIGHT = 2` on DX12).
-///   Speculative acquire after present lets the render thread avoid a synchronous
-///   drawable wait. On DX12 this is safe because FIFO scheduled present on the
-///   submission worker blocks until `IDXGISwapChain3::Present` returns before
-///   speculative acquire calls `GetCurrentBackBufferIndex`.
+/// - **Metal / DX12**: depth=2, speculative_acquire=false by default. Two in-flight
+///   drawables match the physical swapchain ring (`MAX_FRAMES_IN_FLIGHT = 2` on DX12).
+///   Opt in to speculative acquire with `GOLDY_ENABLE_SPECULATIVE_ACQUIRE=1` so
+///   TID_PRESENT acquires after present and the render thread takes the stashed slot
+///   on submit.
 /// - **Vulkan**: depth=1, speculative_acquire=false. Flip-model acquire before
 ///   the previous present has released the image produces an ACQUIRE RACE and
 ///   exhausts the depth gate immediately.
@@ -749,7 +711,7 @@ fn scheme_pool_options(
         goldy::BackendType::Metal | goldy::BackendType::Dx12 => goldy::SwapchainPoolOptions {
             depth: 2,
             config,
-            speculative_acquire: true,
+            speculative_acquire: false,
         },
         goldy::BackendType::Vulkan => goldy::SwapchainPoolOptions {
             depth: 1,
@@ -873,11 +835,9 @@ fn apply_render_cmd(
             *surface_or_pool = Some(sop);
         }
         RenderCmd::SurfaceDropped => {
-            shutdown_trace::phase("render_cmd", "SurfaceDropped");
             *surface_or_pool = None;
         }
         RenderCmd::Shutdown => {
-            shutdown_trace::phase("render_cmd", "Shutdown");
             return false;
         }
     }
@@ -913,7 +873,6 @@ fn drain_commands_without_resize(
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => break,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                shutdown_trace::phase("drain_commands", "channel disconnected");
                 return DrainResult::Shutdown;
             }
         }
@@ -979,7 +938,6 @@ fn reactive_scheme_resize(
     if *present_in_flight {
         let _tz = goldy::tracy_zone!("velato.wait_present_ack");
         if !presenter.wait_for_present_ack() {
-            shutdown_trace::phase("reactive_scheme_resize", "present ack channel closed");
             return false;
         }
         *present_in_flight = false;
@@ -1139,12 +1097,25 @@ impl Presenter {
                 while let Ok(payload) = rx.recv() {
                     let _tz = goldy::tracy_zone!("frame.present.async");
                     let present_err: Option<String> = match payload {
-                        PresentPayload::Classic(frame) => frame.present().err().map(|e| e.to_string()),
-                        PresentPayload::Scheme(token) => token.present().err().map(|e| e.to_string()),
+                        PresentPayload::Classic(frame) => {
+                            let err = frame.present().err().map(|e| e.to_string());
+                            let _ = ack_tx.send(());
+                            err
+                        }
+                        PresentPayload::Scheme(token) => match token.present_scanout_and_grant() {
+                            Ok(grant) => {
+                                // Ack after scanout (consume) but before speculative acquire so
+                                // resize/rebuild is not blocked behind swapchain capacity waits.
+                                let _ = ack_tx.send(());
+                                grant.speculate_next_acquire_after_present();
+                                None
+                            }
+                            Err(e) => {
+                                let _ = ack_tx.send(());
+                                Some(e.to_string())
+                            }
+                        },
                     };
-                    // Ack before checking error so TID_RENDER can proceed;
-                    // if the channel is closed TID_RENDER has already exited.
-                    let _ = ack_tx.send(());
                     if let Some(e) = present_err {
                         eprintln!("present error (TID_PRESENT): {e}");
                         if is_device_lost_error(&e) {
@@ -1153,8 +1124,7 @@ impl Presenter {
                         }
                     }
                 }
-                shutdown_trace::phase("presenter", "TID_PRESENT thread exiting");
-            })
+})
             .expect("spawn TID_PRESENT");
         Self::Threaded {
             tx,
@@ -1225,27 +1195,18 @@ impl Presenter {
     }
 
     fn shutdown(self) {
-        shutdown_trace::phase("presenter", "shutdown begin");
-        match self {
+match self {
             Self::Inline => {
-                shutdown_trace::phase("presenter", "inline mode (no join)");
-            }
+}
             Self::Threaded { tx, mut handle, .. } => {
-                shutdown_trace::phase("presenter", "dropping present channel");
-                drop(tx);
+drop(tx);
                 if let Some(handle) = handle.take() {
-                    shutdown_trace::phase("presenter", "joining TID_PRESENT");
-                    let join_start = Instant::now();
+let join_start = Instant::now();
                     let _ = handle.join();
-                    shutdown_trace::phase(
-                        "presenter",
-                        &format!("TID_PRESENT joined in {} ms", join_start.elapsed().as_millis()),
-                    );
-                }
+}
             }
         }
-        shutdown_trace::phase("presenter", "shutdown complete");
-    }
+}
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,12 +1247,10 @@ fn block_until_surface(
         match cmd_rx.recv() {
             Ok(cmd) => {
                 if !apply_render_cmd(cmd, surface_or_pool, input, stats) {
-                    shutdown_trace::phase("block_until_surface", "Shutdown received");
                     return false;
                 }
             }
             Err(_) => {
-                shutdown_trace::phase("block_until_surface", "command channel disconnected");
                 return false;
             }
         }
@@ -1341,10 +1300,6 @@ fn sync_present_and_drain(
             if *present_in_flight {
                 let _tz = goldy::tracy_zone!("velato.wait_present_ack");
                 if !presenter.wait_for_present_ack() {
-                    shutdown_trace::phase(
-                        "sync_present_and_drain",
-                        "present ack channel closed (TID_PRESENT exited)",
-                    );
                     return false;
                 }
                 *present_in_flight = false;
@@ -1363,10 +1318,6 @@ fn sync_present_and_drain(
             if *present_in_flight && !is_scheme {
                 let _tz = goldy::tracy_zone!("velato.wait_present_ack");
                 if !presenter.wait_for_present_ack() {
-                    shutdown_trace::phase(
-                        "sync_present_and_drain",
-                        "present ack channel closed (TID_PRESENT exited)",
-                    );
                     return false;
                 }
                 *present_in_flight = false;
@@ -1474,10 +1425,9 @@ fn try_submit_to_swapchain(
 ) -> RenderStep<(ekrano::FrameStats, ekrano::PresentToken)> {
     use std::cell::Cell;
 
-    // Present-ack wait is deferred to pre_acquire (after upload submit, before worker
-    // acquire) so upload recording/submit overlaps the previous frame's present.
-    // Flip-model backends (DX12/Vulkan) also require wait_for_acquire_capacity: present
-    // ack fires before the return fence retires and pending_acquire_count drops.
+    // Present-ack wait runs in pre_acquire before worker submit so upload recording
+    // overlaps the previous frame's present. Capacity wait stays here as backpressure
+    // when the speculative stash is empty; with a healthy stash it is usually a no-op.
     let needs_wait = *present_in_flight;
     let consumed_present_ack = Cell::new(false);
     let ack_closed = Cell::new(false);
@@ -1510,7 +1460,6 @@ fn try_submit_to_swapchain(
         Ok(r) => RenderStep::Ok(r),
         Err(e) => {
             if ack_closed.get() {
-                shutdown_trace::phase("try_submit_to_swapchain", "present ack channel closed");
                 return RenderStep::Shutdown;
             }
             if is_device_lost_error(&e) {
@@ -1615,10 +1564,7 @@ fn ekrano_render_thread(
     initial_vsync: bool,
 ) {
     use std::sync::atomic::Ordering;
-
-    shutdown_trace::phase("render_thread", "TID_RENDER started");
-
-    let start = Instant::now();
+let start = Instant::now();
     let mut input = InputState {
         transform: Affine::IDENTITY,
         scene_ix: initial_scene_ix,
@@ -1641,18 +1587,13 @@ fn ekrano_render_thread(
 
     loop {
         if device_lost.load(Ordering::Relaxed) {
-            shutdown_trace::phase("render_loop", "device_lost flag set");
-            break;
+break;
         }
 
         // Phase 1 — Sync: wait for a surface/pool, flush the previous present, then
         // consume any pending UI commands (resize, scene-switch, etc.).
         if !block_until_surface(&cmd_rx, &mut surface_or_pool, &mut input, &stats) {
-            shutdown_trace::phase(
-                "render_thread",
-                "exit early from block_until_surface (presenter.shutdown skipped)",
-            );
-            return;
+return;
         }
         let mut scheme_stash_clear = false;
         if !sync_present_and_drain(
@@ -1666,8 +1607,7 @@ fn ekrano_render_thread(
             &device_lost,
             &mut scheme_stash_clear,
         ) {
-            shutdown_trace::phase("render_loop", "sync_present_and_drain returned false");
-            break;
+break;
         }
         if scheme_stash_clear {
             stash = None;
@@ -1715,8 +1655,7 @@ fn ekrano_render_thread(
                 continue;
             }
             RenderStep::Shutdown => {
-                shutdown_trace::phase("render_loop", "prepare failed (device lost)");
-                break;
+break;
             }
         };
 
@@ -1765,8 +1704,7 @@ fn ekrano_render_thread(
                         continue;
                     }
                     RenderStep::Shutdown => {
-                        shutdown_trace::phase("render_loop", "submit failed (device lost)");
-                        break;
+break;
                     }
                 }
             }
@@ -1792,8 +1730,7 @@ fn ekrano_render_thread(
                 overlap_h,
             );
             if !presenter.send_present_token(present_token, &device_lost) {
-                shutdown_trace::phase("render_loop", "present channel closed");
-                break;
+break;
             }
             present_in_flight = true;
 
@@ -1830,8 +1767,7 @@ fn ekrano_render_thread(
                     }
                     RenderStep::SkipFrame { out_of_date: false } => continue,
                     RenderStep::Shutdown => {
-                        shutdown_trace::phase("render_loop", "submit failed (device lost)");
-                        break;
+break;
                     }
                 }
             }
@@ -1842,8 +1778,7 @@ fn ekrano_render_thread(
                 );
             }
             if !presenter.send_frame(frame, &device_lost) {
-                shutdown_trace::phase("render_loop", "present channel closed");
-                break;
+break;
             }
             present_in_flight = true;
 
@@ -1875,10 +1810,7 @@ fn ekrano_render_thread(
             });
         frame_start_time = new_time;
     }
-
-    shutdown_trace::phase("render_thread", "render loop exited, dropping GoldyRenderer");
-    presenter.shutdown();
-    shutdown_trace::phase("render_thread", "TID_RENDER exiting");
+presenter.shutdown();
 }
 
 #[cfg(feature = "use_ekrano")]
@@ -1990,8 +1922,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 }
                 match event {
                     WindowEvent::CloseRequested => {
-                        shutdown_trace::mark_initiated("CloseRequested");
-                        send_cmd(&cmd_tx, RenderCmd::Shutdown);
+send_cmd(&cmd_tx, RenderCmd::Shutdown);
                         event_loop.exit();
                     }
                     WindowEvent::ModifiersChanged(_) => {}
@@ -2017,8 +1948,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                                     send_cmd(&cmd_tx, RenderCmd::TransformSet(transform));
                                 }
                                 Key::Named(NamedKey::Escape) => {
-                                    shutdown_trace::mark_initiated("Escape");
-                                    send_cmd(&cmd_tx, RenderCmd::Shutdown);
+send_cmd(&cmd_tx, RenderCmd::Shutdown);
                                     event_loop.exit();
                                 }
                                 Key::Character(char) => {
@@ -2126,15 +2056,13 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 }
                 if device_lost.load(Ordering::Relaxed) {
                     eprintln!("GPU device lost — exiting");
-                    shutdown_trace::mark_initiated("device_lost");
-                    send_cmd(&cmd_tx, RenderCmd::Shutdown);
+send_cmd(&cmd_tx, RenderCmd::Shutdown);
                     event_loop.exit();
                     return;
                 }
                 if let Some(deadline) = auto_exit_deadline {
                     if Instant::now() >= deadline {
-                        shutdown_trace::mark_initiated("auto_exit_timeout");
-                        send_cmd(&cmd_tx, RenderCmd::Shutdown);
+send_cmd(&cmd_tx, RenderCmd::Shutdown);
                         event_loop.exit();
                         return;
                     }
@@ -2194,32 +2122,19 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
             }
             Event::LoopExiting => {
                 let _tz = goldy::tracy_zone!("velato.ui_loop_exiting");
-                shutdown_trace::phase("ui", "LoopExiting — dropping command channel");
-                cmd_tx.take();
+cmd_tx.take();
                 window = None;
             }
             _ => {}
         })
         .expect("run to completion");
-
-    shutdown_trace::phase("ui", "event loop returned");
-    let join_start = Instant::now();
-    shutdown_trace::phase("ui", "joining TID_RENDER");
-    let _ = render_thread.join();
-    shutdown_trace::phase(
-        "ui",
-        &format!(
-            "TID_RENDER joined in {} ms",
-            join_start.elapsed().as_millis()
-        ),
-    );
-
-    let snap = bench_stats.lock().expect("stats mutex poisoned").snapshot();
+let join_start = Instant::now();
+let _ = render_thread.join();
+let snap = bench_stats.lock().expect("stats mutex poisoned").snapshot();
     eprintln!(
         "[bench] fps={:.1} frame_ms={:.3} min_ms={:.3} max_ms={:.3}",
         snap.fps, snap.frame_time_ms, snap.frame_time_min_ms, snap.frame_time_max_ms
     );
-    shutdown_trace::phase("ui", "about to drop Device and Instance on main thread");
 }
 
 /// # Panics
@@ -2256,7 +2171,6 @@ pub fn main() -> Result<()> {
     if let Some(scenes) = scenes {
         let event_loop = EventLoopBuilder::<()>::with_user_event().build()?;
         run_ekrano(event_loop, args, scenes);
-        shutdown_trace::phase("main", "run_ekrano returned (Device/Instance dropped)");
-    }
+}
     Ok(())
 }
