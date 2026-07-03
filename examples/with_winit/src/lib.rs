@@ -1189,27 +1189,17 @@ impl Presenter {
         }
     }
 
-    /// Non-blocking check whether TID_PRESENT finished the in-flight frame.
-    fn try_present_ack(&self) -> bool {
-        match self {
-            Self::Inline => true,
-            Self::Threaded { ack_rx, .. } => ack_rx.try_recv().is_ok(),
-        }
-    }
-
     fn shutdown(self) {
-match self {
-            Self::Inline => {
-}
+        match self {
+            Self::Inline => {}
             Self::Threaded { tx, mut handle, .. } => {
-drop(tx);
+                drop(tx);
                 if let Some(handle) = handle.take() {
-let join_start = Instant::now();
                     let _ = handle.join();
-}
+                }
             }
         }
-}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2163,8 +2153,7 @@ cmd_tx.take();
             _ => {}
         })
         .expect("run to completion");
-let join_start = Instant::now();
-let _ = render_thread.join();
+    let _ = render_thread.join();
 let snap = bench_stats.lock().expect("stats mutex poisoned").snapshot();
     eprintln!(
         "[bench] fps={:.1} frame_ms={:.3} min_ms={:.3} max_ms={:.3}",
