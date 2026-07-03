@@ -1321,10 +1321,9 @@ fn sync_present_and_drain(
             apply_deferred_surface_resize(surface_or_pool, input, renderer, device_lost, present_sent_seq)
         }
         DrainResult::Idle => {
-            // Scheme backend defers the present-ack wait to the pre-acquire barrier
-            // inside `submit_to_swapchain_with` (after upload submit, before the
-            // worker acquire) so upload recording/submit overlaps the previous
-            // frame's present. Classic must still gate the acquire here.
+            // Scheme backend defers the present-began wait to the pre-upload barrier
+            // inside `submit_to_swapchain_with` so upload recording/submit overlaps the
+            // previous frame's present. Classic must still gate the acquire here.
             let is_scheme = matches!(surface_or_pool, Some(SurfaceOrPool::Scheme(_)));
             if *present_in_flight && !is_scheme {
                 let _tz = goldy::tracy_zone!("velato.wait_present_ack");
@@ -1437,25 +1436,33 @@ fn try_submit_to_swapchain(
 ) -> RenderStep<(ekrano::FrameStats, ekrano::PresentToken)> {
     use std::cell::Cell;
 
-    // Present-began wait runs in pre_acquire before upload/worker submit so staging
-    // recording overlaps the previous frame's present. Capacity wait stays here as backpressure
-    // when the early-acquire stash is empty.
+    // Present-began wait runs before upload submit (easement gate). Capacity wait runs
+    // after upload submit so upload work overlaps the return-fence wait.
     let needs_wait = *present_in_flight;
     let consumed_present_began = Cell::new(false);
     let ctx = renderer.submission_context();
     let wait_seq = present_sent_seq;
+    let using_stash = pool.has_stashed_drawable();
 
     let result = {
         let consumed_present_began = &consumed_present_began;
-        renderer.submit_to_swapchain_with(prepared, pool, move || {
-            if needs_wait {
-                let _tz = goldy::tracy_zone!("velato.wait_present_began");
-                pool.wait_present_began(wait_seq);
-                consumed_present_began.set(true);
-            }
-            pool.wait_for_submit_acquire(&ctx, pool.has_stashed_drawable());
-            Ok(())
-        })
+        renderer.submit_to_swapchain_with(
+            prepared,
+            pool,
+            move || {
+                if needs_wait {
+                    let _tz = goldy::tracy_zone!("velato.wait_present_began");
+                    pool.wait_present_began(wait_seq);
+                    consumed_present_began.set(true);
+                }
+                Ok(())
+            },
+            move || {
+                let _tz = goldy::tracy_zone!("velato.wait_submit_acquire");
+                pool.wait_for_submit_acquire(&ctx, using_stash);
+                Ok(())
+            },
+        )
     };
 
     if consumed_present_began.get() {
