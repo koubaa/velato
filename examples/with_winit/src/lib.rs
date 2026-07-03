@@ -691,17 +691,14 @@ fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()
 ///
 /// Deleted with the Classic (TaskGraph) backend in Phase 6.
 ///
-/// Scheme present pipeline depth and speculative-acquire policy depend on the
-/// backend:
+/// Scheme present pipeline depth depends on the backend:
 ///
-/// - **Metal / DX12**: depth=2, speculative_acquire=false. Two in-flight drawables match
-///   the physical swapchain ring (`MAX_FRAMES_IN_FLIGHT = 2` on DX12). The render thread
-///   stashes the next drawable during the overlap phase via [`goldy::SwapchainPool::try_early_acquire`]
-///   after dispatching a present token; submit takes the stash via `resolve_present_slot`.
-///   Legacy TID_PRESENT speculative acquire remains opt-in via `GOLDY_ENABLE_SPECULATIVE_ACQUIRE=1`.
-/// - **Vulkan**: depth=1, speculative_acquire=false. Flip-model acquire before
-///   the previous present has released the image produces an ACQUIRE RACE and
-///   exhausts the depth gate immediately.
+/// - **Metal / DX12**: depth=2. Two in-flight drawables match the physical swapchain ring
+///   (`MAX_FRAMES_IN_FLIGHT = 2` on DX12). The render thread stashes the next drawable during
+///   the overlap phase via [`goldy::SwapchainPool::try_early_acquire`] after dispatching a
+///   present token; submit takes the stash via `resolve_present_slot`.
+/// - **Vulkan**: depth=1. Flip-model acquire before the previous present has released the
+///   image produces an ACQUIRE RACE and exhausts the depth gate immediately.
 #[cfg(feature = "use_ekrano")]
 fn scheme_pool_options(
     backend_type: goldy::BackendType,
@@ -711,13 +708,8 @@ fn scheme_pool_options(
         goldy::BackendType::Metal | goldy::BackendType::Dx12 => goldy::SwapchainPoolOptions {
             depth: 2,
             config,
-            speculative_acquire: false,
         },
-        goldy::BackendType::Vulkan => goldy::SwapchainPoolOptions {
-            depth: 1,
-            config,
-            speculative_acquire: false,
-        },
+        goldy::BackendType::Vulkan => goldy::SwapchainPoolOptions { depth: 1, config },
     }
 }
 
