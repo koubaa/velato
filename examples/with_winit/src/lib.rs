@@ -694,11 +694,11 @@ fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()
 /// Scheme present pipeline depth and speculative-acquire policy depend on the
 /// backend:
 ///
-/// - **Metal / DX12**: depth=2, speculative_acquire=false by default. Two in-flight
-///   drawables match the physical swapchain ring (`MAX_FRAMES_IN_FLIGHT = 2` on DX12).
-///   Opt in to speculative acquire with `GOLDY_ENABLE_SPECULATIVE_ACQUIRE=1` so
-///   TID_PRESENT acquires after present and the render thread takes the stashed slot
-///   on submit.
+/// - **Metal / DX12**: depth=2, speculative_acquire=false. Two in-flight drawables match
+///   the physical swapchain ring (`MAX_FRAMES_IN_FLIGHT = 2` on DX12). The render thread
+///   stashes the next drawable during the overlap phase via [`goldy::SwapchainPool::try_early_acquire`]
+///   after dispatching a present token; submit takes the stash via `resolve_present_slot`.
+///   Legacy TID_PRESENT speculative acquire remains opt-in via `GOLDY_ENABLE_SPECULATIVE_ACQUIRE=1`.
 /// - **Vulkan**: depth=1, speculative_acquire=false. Flip-model acquire before
 ///   the previous present has released the image produces an ACQUIRE RACE and
 ///   exhausts the depth gate immediately.
@@ -896,12 +896,13 @@ fn scheme_swapchain_resize(
     renderer: &mut ekrano::GoldyRenderer,
     ctx: &goldy::Context,
     device_lost: &std::sync::atomic::AtomicBool,
+    sent_present_tokens: u64,
     reason: &str,
 ) -> bool {
     let Some(SurfaceOrPool::Scheme(p)) = surface_or_pool.as_mut() else {
         return true;
     };
-    p.sync_before_rebuild(ctx);
+    p.sync_before_rebuild(ctx, sent_present_tokens);
     match p.resize(input.width, input.height) {
         Ok(()) => {
             input.width = p.width();
@@ -954,6 +955,7 @@ fn reactive_scheme_resize(
         renderer,
         &renderer.submission_context(),
         device_lost,
+        present_sent_seq,
         "reactive",
     )
 }
@@ -964,6 +966,7 @@ fn apply_deferred_surface_resize(
     input: &mut InputState,
     renderer: &mut ekrano::GoldyRenderer,
     device_lost: &std::sync::atomic::AtomicBool,
+    sent_present_tokens: u64,
 ) -> bool {
     // A present-mode change (ToggleVsync) requires an immediate swapchain rebuild before
     // the next frame. The surface/pool may clamp the requested dimensions to its capability
@@ -982,6 +985,7 @@ fn apply_deferred_surface_resize(
                 renderer,
                 &renderer.submission_context(),
                 device_lost,
+                sent_present_tokens,
                 "proactive",
             )
         }
@@ -1111,7 +1115,9 @@ impl Presenter {
                         // Scheme path: lifecycle is pool counters (present_began / present_completed).
                         // Do not send on ack_tx — velato no longer drains it on this path and a
                         // capacity-1 sync_channel would wedge TID_PRESENT after the second frame.
-                        PresentPayload::Scheme(token) => token.present_scanout().err().map(|e| e.to_string()),
+                        PresentPayload::Scheme(token) => {
+                            token.present_scanout().err().map(|e| e.to_string())
+                        }
                     };
                     if let Some(e) = present_err {
                         eprintln!("present error (TID_PRESENT): {e}");
@@ -1290,6 +1296,7 @@ fn sync_present_and_drain(
     renderer: &mut ekrano::GoldyRenderer,
     device_lost: &std::sync::atomic::AtomicBool,
     scheme_stash_clear: &mut bool,
+    scheme_skip_early_acquire: &mut bool,
 ) -> bool {
     let drain = drain_commands_without_resize(cmd_rx, surface_or_pool, input, stats);
     match drain {
@@ -1309,8 +1316,9 @@ fn sync_present_and_drain(
             }
             if matches!(surface_or_pool, Some(SurfaceOrPool::Scheme(_))) {
                 *scheme_stash_clear = true;
+                *scheme_skip_early_acquire = true;
             }
-            apply_deferred_surface_resize(surface_or_pool, input, renderer, device_lost)
+            apply_deferred_surface_resize(surface_or_pool, input, renderer, device_lost, present_sent_seq)
         }
         DrainResult::Idle => {
             // Scheme backend defers the present-ack wait to the pre-acquire barrier
@@ -1445,7 +1453,7 @@ fn try_submit_to_swapchain(
                 pool.wait_present_began(wait_seq);
                 consumed_present_began.set(true);
             }
-            pool.wait_for_acquire_capacity(&ctx);
+            pool.wait_for_submit_acquire(&ctx, pool.has_stashed_drawable());
             Ok(())
         })
     };
@@ -1498,6 +1506,16 @@ fn build_overlap_scene_params(
         render_height,
     );
     params
+}
+
+/// Stash the next drawable during the overlap phase after dispatching a present token.
+///
+/// Runs on the render thread while `TID_PRESENT` consumes the previous grant, so DXGI
+/// acquire latency hides behind overlap CPU work instead of sitting on the submit path.
+#[cfg(feature = "use_ekrano")]
+fn try_overlap_early_acquire(pool: &goldy::SwapchainPool, present_sent_seq: u64) {
+    let _tz = goldy::tracy_zone!("velato.early_acquire");
+    let _ = pool.try_early_acquire(present_sent_seq);
 }
 
 /// Run phase-1 `ekrano.prepare` for a scene already built by [`build_overlap_scene_params`].
@@ -1592,6 +1610,7 @@ break;
 return;
         }
         let mut scheme_stash_clear = false;
+        let mut scheme_skip_early_acquire = false;
         if !sync_present_and_drain(
             &mut present_in_flight,
             present_sent_seq,
@@ -1603,6 +1622,7 @@ return;
             &mut renderer,
             &device_lost,
             &mut scheme_stash_clear,
+            &mut scheme_skip_early_acquire,
         ) {
 break;
         }
@@ -1672,10 +1692,6 @@ break;
                     SurfaceOrPool::Scheme(p) => p,
                     _ => unreachable!(),
                 };
-                {
-                    let _tz = goldy::tracy_zone!("velato.early_acquire");
-                    let _ = pool_ref.try_early_acquire(present_sent_seq);
-                }
                 let submit = try_submit_to_swapchain(
                     &mut renderer,
                     prepared,
@@ -1735,11 +1751,19 @@ break;
             if !presenter.send_present_token(present_token, &device_lost) {
 break;
             }
+            let prior_sent_seq = present_sent_seq;
             present_sent_seq += 1;
             present_in_flight = true;
 
-            // Phase 4 — `ekrano.prepare` for the next frame while TID_PRESENT
-            // presents the frame just submitted and speculatively acquires the next drawable.
+            // Phase 4 — overlap: acquire the next drawable and prepare frame N+1 while
+            // TID_PRESENT consumes the grant we just sent (present-began / WSI Present).
+            // Gate on prior_sent_seq (frames already dispatched), not present_sent_seq
+            // (the token we just sent — presents_begun won't have caught up yet).
+            if let Some(SurfaceOrPool::Scheme(pool)) = surface_or_pool.as_ref() {
+                if !scheme_skip_early_acquire {
+                    try_overlap_early_acquire(pool, prior_sent_seq);
+                }
+            }
             stash = overlap_prepare_from_params(&mut renderer, &scene, &overlap_params);
         } else {
             // Classic path.
