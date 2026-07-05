@@ -671,7 +671,6 @@ pub fn main() -> Result<()> {
 // Ekrano backend
 // ---------------------------------------------------------------------------
 
-
 #[cfg(feature = "use_ekrano")]
 fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()>) -> Arc<Window> {
     use winit::dpi::LogicalSize;
@@ -1083,6 +1082,9 @@ enum Presenter {
 #[cfg(feature = "use_ekrano")]
 impl Presenter {
     fn new(device_lost: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        if std::env::var_os("EKRANO_INLINE_PRESENT").is_some() {
+            return Self::Inline;
+        }
         // Capacity 0 would be a rendezvous; 1 lets TID_RENDER stay one
         // frame ahead of TID_PRESENT while still bounding the pipeline.
         let (tx, rx) = std::sync::mpsc::sync_channel::<PresentPayload>(1);
@@ -1107,9 +1109,7 @@ impl Presenter {
                         // Scheme path: lifecycle is pool counters (present_began / present_completed).
                         // Do not send on ack_tx — velato no longer drains it on this path and a
                         // capacity-1 sync_channel would wedge TID_PRESENT after the second frame.
-                        PresentPayload::Scheme(token) => {
-                            token.present_scanout().err().map(|e| e.to_string())
-                        }
+                        PresentPayload::Scheme(token) => token.present_scanout().err().map(|e| e.to_string()),
                     };
                     if let Some(e) = present_err {
                         eprintln!("present error (TID_PRESENT): {e}");
@@ -1501,10 +1501,21 @@ fn build_overlap_scene_params(
 ///
 /// Runs on the render thread while `TID_PRESENT` consumes the previous grant, so DXGI
 /// acquire latency hides behind overlap CPU work instead of sitting on the submit path.
+///
+/// Metal is intentionally excluded: `CAMetalLayer.nextDrawable()` is vsync-paced
+/// regardless of nominal pool capacity, so calling it this early (immediately after
+/// dispatching the present token, before that present has had any chance to retire)
+/// just moves the vsync stall onto the render thread instead of avoiding it. On Metal
+/// the equivalent acquire runs on `TID_PRESENT` after the present is actually consumed —
+/// see `goldy::SwapchainPool`'s internal `try_acquire_after_present` (called from
+/// `PresentGrant::consume`).
 #[cfg(feature = "use_ekrano")]
-fn try_overlap_early_acquire(pool: &goldy::SwapchainPool, present_sent_seq: u64) {
+fn try_overlap_early_acquire(pool: &goldy::SwapchainPool, ctx: &goldy::Context, present_sent_seq: u64) {
+    if ctx.device().backend_type() == goldy::BackendType::Metal {
+        return;
+    }
     let _tz = goldy::tracy_zone!("velato.early_acquire");
-    let _ = pool.try_early_acquire(present_sent_seq);
+    let _ = pool.try_early_acquire(ctx, present_sent_seq);
 }
 
 /// Run phase-1 `ekrano.prepare` for a scene already built by [`build_overlap_scene_params`].
@@ -1691,7 +1702,9 @@ break;
                     present_sent_seq,
                 );
                 match submit {
-                    RenderStep::Ok(r) => (frame_stats, present_token) = r,
+                    RenderStep::Ok(r) => {
+                        (frame_stats, present_token) = r;
+                    }
                     RenderStep::SkipFrame { out_of_date: true } => {
                         stash = None;
                         if !reactive_scheme_resize(
@@ -1750,7 +1763,7 @@ break;
             // (the token we just sent — presents_begun won't have caught up yet).
             if let Some(SurfaceOrPool::Scheme(pool)) = surface_or_pool.as_ref() {
                 if !scheme_skip_early_acquire {
-                    try_overlap_early_acquire(pool, prior_sent_seq);
+                    try_overlap_early_acquire(pool, &renderer.submission_context(), prior_sent_seq);
                 }
             }
             stash = overlap_prepare_from_params(&mut renderer, &scene, &overlap_params);
