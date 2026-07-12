@@ -11,9 +11,9 @@ use vello::low_level::BumpAllocators;
 #[cfg(feature = "use_vello")]
 use vello::{AaConfig, Scene};
 
-#[cfg(all(feature = "use_ekrano", not(feature = "use_vello")))]
+#[cfg(feature = "use_ekrano")]
 use ekrano::low_level::BumpAllocators;
-#[cfg(all(feature = "use_ekrano", not(feature = "use_vello")))]
+#[cfg(feature = "use_ekrano")]
 use ekrano::{AaConfig, Scene};
 
 const SLIDING_WINDOW_SIZE: usize = 100;
