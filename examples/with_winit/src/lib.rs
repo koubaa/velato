@@ -704,6 +704,45 @@ mod shutdown_trace {
     }
 }
 
+/// Coordinates HWND vs DXGI/Metal swapchain lifetime across UI and render threads.
+///
+/// DXGI requires the swapchain to be released before its HWND is destroyed. The UI
+/// thread owns the window; TID_RENDER owns the surface. Without this gate, `LoopExiting`
+/// / `Suspended` can destroy the HWND while a retained resubmit or present still holds
+/// the swapchain — WARP then AVs inside `d3d10warp.dll` on the goldy submit worker.
+#[cfg(feature = "use_ekrano")]
+struct SurfaceLifetime {
+    released: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(feature = "use_ekrano")]
+impl SurfaceLifetime {
+    fn new_released() -> Self {
+        Self {
+            released: std::sync::Mutex::new(true),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn mark_held(&self) {
+        *self.released.lock().unwrap() = false;
+        self.cv.notify_all();
+    }
+
+    fn mark_released(&self) {
+        *self.released.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+
+    fn wait_released(&self) {
+        let mut g = self.released.lock().unwrap();
+        while !*g {
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+}
+
 #[cfg(feature = "use_ekrano")]
 fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()>) -> Arc<Window> {
     use winit::dpi::LogicalSize;
@@ -772,6 +811,10 @@ fn apply_render_cmd(
     surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
+    surface_lifetime: &SurfaceLifetime,
+    // When set, drain goldy-submit + GPU before releasing the swapchain so
+    // retained command lists cannot Execute against freed DXGI resources.
+    render_ctx: Option<&goldy::Context>,
 ) -> bool {
     use goldy::PresentMode;
 
@@ -828,17 +871,43 @@ fn apply_render_cmd(
             input.width = width;
             input.height = height;
             *surface_or_pool = Some(sop);
+            surface_lifetime.mark_held();
         }
         RenderCmd::SurfaceDropped => {
             shutdown_trace::phase("render_cmd", "SurfaceDropped");
+            drain_gpu_before_surface_drop(render_ctx);
             *surface_or_pool = None;
+            surface_lifetime.mark_released();
         }
         RenderCmd::Shutdown => {
             shutdown_trace::phase("render_cmd", "Shutdown");
+            // Surface drop + mark_released happen in the render-thread cleanup path
+            // after present join, GPU drain, and renderer drop (DXGI: swapchain before HWND).
             return false;
         }
     }
     true
+}
+
+/// Block until goldy-submit has executed and the GPU has retired work up through
+/// the context high-water mark. Required before destroying swapchain-backed
+/// resources that retained command lists may still reference.
+#[cfg(feature = "use_ekrano")]
+fn drain_gpu_before_surface_drop(render_ctx: Option<&goldy::Context>) {
+    let Some(ctx) = render_ctx else {
+        return;
+    };
+    let hw = ctx.high_water_timeline();
+    if hw == 0 {
+        return;
+    }
+    shutdown_trace::phase(
+        "render_thread",
+        &format!("draining GPU/submit worker through timeline={hw}"),
+    );
+    if let Err(e) = ctx.wait_until(hw) {
+        tracing::warn!(error = %e, "wait_until before surface drop failed");
+    }
 }
 
 #[cfg(feature = "use_ekrano")]
@@ -847,6 +916,8 @@ fn drain_commands(
     surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
+    surface_lifetime: &SurfaceLifetime,
+    render_ctx: &goldy::Context,
 ) -> bool {
     let _tz = goldy::tracy_zone!("velato.drain_commands");
     // Set when a command that can change surface dimensions or present mode is drained.
@@ -869,7 +940,14 @@ fn drain_commands(
         match cmd_rx.try_recv() {
             Ok(cmd) => {
                 surface_dirty |= matches!(cmd, RenderCmd::Resize(..) | RenderCmd::ToggleVsync);
-                if !apply_render_cmd(cmd, surface_or_pool, input, stats) {
+                if !apply_render_cmd(
+                    cmd,
+                    surface_or_pool,
+                    input,
+                    stats,
+                    surface_lifetime,
+                    Some(render_ctx),
+                ) {
                     return false;
                 }
             }
@@ -1122,12 +1200,21 @@ fn block_until_surface(
     surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
+    surface_lifetime: &SurfaceLifetime,
+    render_ctx: &goldy::Context,
 ) -> bool {
     while surface_or_pool.is_none() {
         let _tz = goldy::tracy_zone!("velato.wait_surface");
         match cmd_rx.recv() {
             Ok(cmd) => {
-                if !apply_render_cmd(cmd, surface_or_pool, input, stats) {
+                if !apply_render_cmd(
+                    cmd,
+                    surface_or_pool,
+                    input,
+                    stats,
+                    surface_lifetime,
+                    Some(render_ctx),
+                ) {
                     shutdown_trace::phase("block_until_surface", "Shutdown received");
                     return false;
                 }
@@ -1160,6 +1247,8 @@ fn sync_present_and_drain(
     surface_or_pool: &mut Option<SurfaceOrPool>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
+    surface_lifetime: &SurfaceLifetime,
+    render_ctx: &goldy::Context,
 ) -> bool {
     if *present_in_flight {
         let _tz = goldy::tracy_zone!("velato.wait_present_ack");
@@ -1172,7 +1261,14 @@ fn sync_present_and_drain(
         }
         *present_in_flight = false;
     }
-    drain_commands(cmd_rx, surface_or_pool, input, stats)
+    drain_commands(
+        cmd_rx,
+        surface_or_pool,
+        input,
+        stats,
+        surface_lifetime,
+        render_ctx,
+    )
 }
 
 /// Returns the stashed `PreparedFrame` when its dimensions still match the
@@ -1322,6 +1418,7 @@ fn ekrano_render_thread(
     base_color: Option<Color>,
     stats: Arc<std::sync::Mutex<stats::Stats>>,
     device_lost: Arc<std::sync::atomic::AtomicBool>,
+    surface_lifetime: Arc<SurfaceLifetime>,
     initial_scene_ix: i32,
     initial_vsync: bool,
 ) {
@@ -1349,6 +1446,7 @@ fn ekrano_render_thread(
     let presenter = Presenter::new(Arc::clone(&device_lost));
     let mut present_in_flight = false;
     let mut surface_or_pool: Option<SurfaceOrPool> = None;
+    let render_ctx = renderer.submission_context();
 
     loop {
         if device_lost.load(Ordering::Relaxed) {
@@ -1358,12 +1456,16 @@ fn ekrano_render_thread(
 
         // Phase 1 — Sync: wait for a surface/pool, flush the previous present, then
         // consume any pending UI commands (resize, scene-switch, etc.).
-        if !block_until_surface(&cmd_rx, &mut surface_or_pool, &mut input, &stats) {
-            shutdown_trace::phase(
-                "render_thread",
-                "exit early from block_until_surface (presenter.shutdown skipped)",
-            );
-            return;
+        if !block_until_surface(
+            &cmd_rx,
+            &mut surface_or_pool,
+            &mut input,
+            &stats,
+            &surface_lifetime,
+            &render_ctx,
+        ) {
+            shutdown_trace::phase("render_loop", "exit from block_until_surface");
+            break;
         }
         if !sync_present_and_drain(
             &mut present_in_flight,
@@ -1372,6 +1474,8 @@ fn ekrano_render_thread(
             &mut surface_or_pool,
             &mut input,
             &stats,
+            &surface_lifetime,
+            &render_ctx,
         ) {
             shutdown_trace::phase("render_loop", "sync_present_and_drain returned false");
             break;
@@ -1543,8 +1647,28 @@ fn ekrano_render_thread(
         frame_start_time = new_time;
     }
 
-    shutdown_trace::phase("render_thread", "render loop exited, dropping GoldyRenderer");
+    // DXGI / D3D12 teardown order:
+    //   1. Finish in-flight present (PresentToken/Frame may hold the swapchain)
+    //   2. Join TID_PRESENT
+    //   3. Drain goldy-submit + GPU, then drop the renderer (Scheme::drop waits
+    //      high-water and releases retained CBs while swapchain textures still live)
+    //   4. Drop the swapchain, then signal UI that the HWND may be destroyed
+    if present_in_flight {
+        shutdown_trace::phase("render_thread", "waiting for in-flight present before surface drop");
+        let _ = presenter.wait_for_present_ack();
+    }
+    shutdown_trace::phase("render_thread", "render loop exited, shutting down presenter");
     presenter.shutdown();
+
+    drop(stash);
+    drain_gpu_before_surface_drop(Some(&render_ctx));
+    shutdown_trace::phase("render_thread", "dropping GoldyRenderer");
+    drop(renderer);
+
+    if surface_or_pool.take().is_some() {
+        shutdown_trace::phase("render_thread", "dropping surface/swapchain");
+    }
+    surface_lifetime.mark_released();
     shutdown_trace::phase("render_thread", "TID_RENDER exiting");
 }
 
@@ -1609,10 +1733,12 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
 
     let stats = Arc::new(Mutex::new(stats::Stats::new()));
     let device_lost = Arc::new(AtomicBool::new(false));
+    let surface_lifetime = Arc::new(SurfaceLifetime::new_released());
     let (cmd_tx, cmd_rx) = mpsc::channel::<RenderCmd>();
 
     let render_stats = Arc::clone(&stats);
     let render_device_lost = Arc::clone(&device_lost);
+    let render_surface_lifetime = Arc::clone(&surface_lifetime);
     let bench_stats = Arc::clone(&stats);
     let render_thread = std::thread::spawn(move || {
         ekrano_render_thread(
@@ -1622,6 +1748,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
             base_color,
             render_stats,
             render_device_lost,
+            render_surface_lifetime,
             initial_scene_ix,
             vsync,
         );
@@ -1857,6 +1984,10 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
             Event::Suspended => {
                 let _tz = goldy::tracy_zone!("velato.ui_suspended");
                 send_cmd(&cmd_tx, RenderCmd::SurfaceDropped);
+                // Wait until TID_RENDER has dropped the swapchain before destroying
+                // the HWND (DXGI lifetime rule).
+                shutdown_trace::phase("ui", "Suspended — waiting for surface release");
+                surface_lifetime.wait_released();
                 window = None;
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
@@ -1864,6 +1995,11 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                 let _tz = goldy::tracy_zone!("velato.ui_loop_exiting");
                 shutdown_trace::phase("ui", "LoopExiting — dropping command channel");
                 cmd_tx.take();
+                // HWND must outlive the DXGI/Metal swapchain. TID_RENDER drops the
+                // surface then signals; only then is it safe to destroy the window.
+                shutdown_trace::phase("ui", "LoopExiting — waiting for surface release");
+                surface_lifetime.wait_released();
+                shutdown_trace::phase("ui", "LoopExiting — dropping window");
                 window = None;
             }
             _ => {}
