@@ -100,23 +100,26 @@ Then record traces with `xctrace` from the Xcode command-line tools (`--timeout-
 mkdir -p metal-traces
 
 xcrun xctrace record --template 'Metal System Trace' --time-limit 14s --no-prompt \
-  --output metal-traces/vello-metal-system.trace --launch -- \
-  target/trace-vello/release/with_winit_bin --timeout-secs 12 --no-vsync
-
-xcrun xctrace record --template 'Metal System Trace' --time-limit 14s --no-prompt \
   --output metal-traces/ekrano-metal-system.trace --launch -- \
-  target/trace-ekrano/release/with_winit_bin --timeout-secs 12 --no-vsync
-
-xcrun xctrace record --template 'Allocations' --time-limit 14s --no-prompt \
-  --output metal-traces/vello-allocations.trace --launch -- \
-  target/trace-vello/release/with_winit_bin --timeout-secs 12 --no-vsync
+  target/release/with_winit_bin --timeout-secs 12 --no-vsync
 
 xcrun xctrace record --template 'Allocations' --time-limit 14s --no-prompt \
   --output metal-traces/ekrano-allocations.trace --launch -- \
-  target/trace-ekrano/release/with_winit_bin --timeout-secs 12 --no-vsync
+  target/release/with_winit_bin --timeout-secs 12 --no-vsync
 ```
 
 Open the `.trace` bundles in **Instruments** after recording. Run the commands above from the Velato workspace root (the directory that contains Velato’s top-level `Cargo.toml`).
+
+For **shader-internal** profiling (register pressure, occupancy, per-line costs), use Goldy’s opt-in Metal GPU capture instead of Instruments. This writes a `.gputrace` that opens in **Xcode → Metal Debugger → Performance**:
+
+```shell
+mkdir -p metal-traces
+GOLDY_METAL_CAPTURE="$PWD/metal-traces/ekrano-tiger.gputrace,skip=120,frames=1" \
+  target/release/with_winit_bin --timeout-secs 12 --no-vsync
+open metal-traces/ekrano-tiger.gputrace
+```
+
+Dispatch / PSO labels such as `fine_area` and `coarse` appear in the capture timeline.
 
 ### Web platform
 
