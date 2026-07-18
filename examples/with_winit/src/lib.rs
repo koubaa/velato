@@ -759,7 +759,7 @@ fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()
 
 #[cfg(feature = "use_ekrano")]
 enum RenderCmd {
-    SurfaceCreated(goldy::SwapchainPool),
+    SurfaceCreated(goldy::SurfaceExchange),
     SurfaceDropped,
     TransformSet(Affine),
     SceneDelta(i32),
@@ -798,7 +798,7 @@ fn is_device_lost_error(err: &impl std::fmt::Display) -> bool {
 #[cfg(feature = "use_ekrano")]
 fn apply_render_cmd(
     cmd: RenderCmd,
-    swapchain_pool: &mut Option<goldy::SwapchainPool>,
+    surface_exchange: &mut Option<goldy::SurfaceExchange>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
     surface_lifetime: &SurfaceLifetime,
@@ -827,7 +827,7 @@ fn apply_render_cmd(
         RenderCmd::ToggleVsync => {
             input.vsync = !input.vsync;
             let mode = if input.vsync { PresentMode::Fifo } else { PresentMode::Immediate };
-            match swapchain_pool.as_mut() {
+            match surface_exchange.as_mut() {
                 None => return true,
                 Some(pool) => {
                     match pool.set_present_mode(mode) {
@@ -847,17 +847,17 @@ fn apply_render_cmd(
             input.width = width;
             input.height = height;
         }
-        RenderCmd::SurfaceCreated(pool) => {
-            let (width, height) = pool.size();
+        RenderCmd::SurfaceCreated(exchange) => {
+            let (width, height) = exchange.size();
             input.width = width;
             input.height = height;
-            *swapchain_pool = Some(pool);
+            *surface_exchange = Some(exchange);
             surface_lifetime.mark_held();
         }
         RenderCmd::SurfaceDropped => {
             shutdown_trace::phase("render_cmd", "SurfaceDropped");
             drain_gpu_before_surface_drop(render_ctx);
-            *swapchain_pool = None;
+            *surface_exchange = None;
             surface_lifetime.mark_released();
         }
         RenderCmd::Shutdown => {
@@ -894,7 +894,7 @@ fn drain_gpu_before_surface_drop(render_ctx: Option<&goldy::Context>) {
 #[cfg(feature = "use_ekrano")]
 fn drain_commands(
     cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
-    swapchain_pool: &mut Option<goldy::SwapchainPool>,
+    surface_exchange: &mut Option<goldy::SurfaceExchange>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
     surface_lifetime: &SurfaceLifetime,
@@ -923,7 +923,7 @@ fn drain_commands(
                 surface_dirty |= matches!(cmd, RenderCmd::Resize(..) | RenderCmd::ToggleVsync);
                 if !apply_render_cmd(
                     cmd,
-                    swapchain_pool,
+                    surface_exchange,
                     input,
                     stats,
                     surface_lifetime,
@@ -944,11 +944,11 @@ fn drain_commands(
         // A present-mode change (ToggleVsync) requires an immediate swapchain rebuild before
         // the next frame. The surface/pool may clamp the requested dimensions to its capability
         // limits, so sync input.width/height to the real swapchain afterwards.
-        match swapchain_pool.as_mut() {
-            Some(pool) => {
-                let _ = pool.resize(input.width, input.height);
-                input.width = pool.width();
-                input.height = pool.height();
+        match surface_exchange.as_mut() {
+            Some(surface) => {
+                let _ = surface.resize(input.width, input.height);
+                input.width = surface.width();
+                input.height = surface.height();
             }
             None => {}
         }
@@ -1156,7 +1156,7 @@ enum RenderStep<T> {
     Shutdown,
 }
 
-/// Blocks the render thread until a [`goldy::SwapchainPool`] is available, processing
+/// Blocks the render thread until a [`goldy::SurfaceExchange`] is available, processing
 /// any incoming [`RenderCmd`]s in the meantime.
 ///
 /// Returns `false` if the thread should exit entirely (channel disconnected or
@@ -1164,19 +1164,19 @@ enum RenderStep<T> {
 #[cfg(feature = "use_ekrano")]
 fn block_until_surface(
     cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
-    swapchain_pool: &mut Option<goldy::SwapchainPool>,
+    surface_exchange: &mut Option<goldy::SurfaceExchange>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
     surface_lifetime: &SurfaceLifetime,
     render_ctx: &goldy::Context,
 ) -> bool {
-    while swapchain_pool.is_none() {
+    while surface_exchange.is_none() {
         let _tz = goldy::tracy_zone!("velato.wait_surface");
         match cmd_rx.recv() {
             Ok(cmd) => {
                 if !apply_render_cmd(
                     cmd,
-                    swapchain_pool,
+                    surface_exchange,
                     input,
                     stats,
                     surface_lifetime,
@@ -1211,7 +1211,7 @@ fn sync_present_and_drain(
     present_in_flight: &mut bool,
     presenter: &Presenter,
     cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
-    swapchain_pool: &mut Option<goldy::SwapchainPool>,
+    surface_exchange: &mut Option<goldy::SurfaceExchange>,
     input: &mut InputState,
     stats: &Arc<std::sync::Mutex<stats::Stats>>,
     surface_lifetime: &SurfaceLifetime,
@@ -1230,7 +1230,7 @@ fn sync_present_and_drain(
     }
     drain_commands(
         cmd_rx,
-        swapchain_pool,
+        surface_exchange,
         input,
         stats,
         surface_lifetime,
@@ -1288,7 +1288,7 @@ fn take_stash_or_rebuild(
     }
 }
 
-/// Submits a [`PreparedFrame`] to the swapchain pool and returns a
+/// Submits a [`PreparedFrame`] to the surface exchange and returns a
 /// [`ekrano::PresentToken`] for async scanout on `TID_PRESENT`.
 ///
 /// Returns [`RenderStep::SkipFrame`] on a transient error and
@@ -1297,10 +1297,10 @@ fn take_stash_or_rebuild(
 fn try_submit_to_swapchain(
     renderer: &mut ekrano::GoldyRenderer,
     prepared: ekrano::PreparedFrame,
-    pool: &goldy::SwapchainPool,
+    surface: &goldy::SurfaceExchange,
     device_lost: &std::sync::atomic::AtomicBool,
 ) -> RenderStep<(ekrano::FrameStats, ekrano::PresentToken)> {
-    match renderer.submit_to_swapchain(prepared, pool) {
+    match renderer.submit_to_swapchain(prepared, surface) {
         Ok(result) => RenderStep::Ok(result),
         Err(e) => {
             eprintln!("submit_to_swapchain error: {e}");
@@ -1386,7 +1386,7 @@ fn ekrano_render_thread(
     let mut frame_start_time = Instant::now();
     let presenter = Presenter::new(Arc::clone(&device_lost));
     let mut present_in_flight = false;
-    let mut swapchain_pool: Option<goldy::SwapchainPool> = None;
+    let mut surface_exchange: Option<goldy::SurfaceExchange> = None;
     let render_ctx = renderer.submission_context();
 
     loop {
@@ -1399,7 +1399,7 @@ fn ekrano_render_thread(
         // consume any pending UI commands (resize, scene-switch, etc.).
         if !block_until_surface(
             &cmd_rx,
-            &mut swapchain_pool,
+            &mut surface_exchange,
             &mut input,
             &stats,
             &surface_lifetime,
@@ -1412,7 +1412,7 @@ fn ekrano_render_thread(
             &mut present_in_flight,
             &presenter,
             &cmd_rx,
-            &mut swapchain_pool,
+            &mut surface_exchange,
             &mut input,
             &stats,
             &surface_lifetime,
@@ -1422,7 +1422,7 @@ fn ekrano_render_thread(
             break;
         }
 
-        if swapchain_pool.is_none() {
+        if surface_exchange.is_none() {
             continue;
         }
         if input.width == 0 || input.height == 0 {
@@ -1463,17 +1463,17 @@ fn ekrano_render_thread(
         // calls `token.present()` asynchronously.
         let (frame_stats, token): (ekrano::FrameStats, ekrano::PresentToken);
         {
-            // Scope limits the immutable borrow of swapchain_pool so the SkipFrame
+            // Scope limits the immutable borrow of surface_exchange so the SkipFrame
             // arm can reborrow it for the reactive resize.
-            let pool_ref = swapchain_pool.as_ref().unwrap();
-            let submit = try_submit_to_swapchain(&mut renderer, prepared, pool_ref, &device_lost);
+            let surface_ref = surface_exchange.as_ref().unwrap();
+            let submit = try_submit_to_swapchain(&mut renderer, prepared, surface_ref, &device_lost);
             match submit {
                 RenderStep::Ok(r) => (frame_stats, token) = r,
                 RenderStep::SkipFrame => {
-                    if let Some(pool) = swapchain_pool.as_ref() {
-                        let _ = pool.resize(input.width, input.height);
-                        input.width = pool.width();
-                        input.height = pool.height();
+                    if let Some(surface) = surface_exchange.as_ref() {
+                        let _ = surface.resize(input.width, input.height);
+                        input.width = surface.width();
+                        input.height = surface.height();
                     }
                     continue;
                 }
@@ -1537,8 +1537,8 @@ fn ekrano_render_thread(
     shutdown_trace::phase("render_thread", "dropping GoldyRenderer");
     drop(renderer);
 
-    if swapchain_pool.take().is_some() {
-        shutdown_trace::phase("render_thread", "dropping swapchain pool");
+    if surface_exchange.take().is_some() {
+        shutdown_trace::phase("render_thread", "dropping surface exchange");
     }
     surface_lifetime.mark_released();
     shutdown_trace::phase("render_thread", "TID_RENDER exiting");
@@ -1549,7 +1549,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     use ekrano::GoldyRenderer;
     use goldy::{
         DeviceDescriptor, Instance, PresentMode, RequestAdapterOptions, SurfaceConfig,
-        SwapchainPool,
+        SurfaceExchange,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Sender};
@@ -1831,14 +1831,14 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
                     present_mode: initial_mode,
                     depth_format: None,
                 };
-                let pool = SwapchainPool::new_with_config(
+                let surface_exchange = SurfaceExchange::new_with_depth(
                     &render_ctx,
                     win.as_ref(),
                     1,
                     config,
                 )
-                .expect("Failed to create goldy swapchain pool");
-                send_cmd(&cmd_tx, RenderCmd::SurfaceCreated(pool));
+                .expect("Failed to create goldy surface exchange");
+                send_cmd(&cmd_tx, RenderCmd::SurfaceCreated(surface_exchange));
                 window = Some(win);
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
