@@ -870,24 +870,17 @@ fn apply_render_cmd(
     true
 }
 
-/// Block until goldy-submit has executed and the GPU has retired work up through
-/// the context high-water mark. Required before destroying swapchain-backed
+/// Block until goldy-submit has executed and the GPU has retired all work
+/// scheduled on this context. Required before destroying swapchain-backed
 /// resources that retained command lists may still reference.
 #[cfg(feature = "use_ekrano")]
 fn drain_gpu_before_surface_drop(render_ctx: Option<&goldy::Context>) {
     let Some(ctx) = render_ctx else {
         return;
     };
-    let hw = ctx.high_water_timeline();
-    if hw == 0 {
-        return;
-    }
-    shutdown_trace::phase(
-        "render_thread",
-        &format!("draining GPU/submit worker through timeline={hw}"),
-    );
-    if let Err(e) = ctx.wait_until(hw) {
-        tracing::warn!(error = %e, "wait_until before surface drop failed");
+    shutdown_trace::phase("render_thread", "draining GPU/submit worker until idle");
+    if let Err(e) = ctx.wait_until_idle() {
+        tracing::warn!(error = %e, "wait_until_idle before surface drop failed");
     }
 }
 
@@ -1584,10 +1577,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     let start_create = Instant::now();
     let renderer = GoldyRenderer::new(&device).expect("Failed to create ekrano renderer");
     // Clone the renderer's submission context so the surface can be created on
-    // the same timeline semaphore as the renderer. This ensures gpu_progress()
-    // and BoundaryCrossed signals fired by the renderer's poller correctly
-    // reflect surface-frame completion — the fix for the RT-cache/reclamation
-    // mismatch introduced by goldy #179 increment 3a per-context timelines.
+    // the same context as the renderer (shared submit / settlement clock).
     let render_ctx = renderer.submission_context();
     eprintln!("Creating ekrano renderer took {:?}", start_create.elapsed());
 
