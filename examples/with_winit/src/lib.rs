@@ -1535,6 +1535,7 @@ fn ekrano_render_thread(
     drop(stash);
     drain_gpu_before_surface_drop(Some(&render_ctx));
     shutdown_trace::phase("render_thread", "dropping GoldyRenderer");
+    renderer.log_scene_growth_summary();
     drop(renderer);
 
     if surface_exchange.take().is_some() {
