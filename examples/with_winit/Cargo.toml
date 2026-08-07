@@ -22,8 +22,26 @@ workspace = true
 [features]
 default = ["use_vello"]
 use_vello = ["dep:vello", "dep:wgpu", "scenes/use_vello"]
-use_ekrano = ["dep:ekrano", "dep:goldy", "scenes/use_ekrano"]
-tracy = ["use_ekrano", "ekrano/tracy", "goldy/tracy"]
+ekrano_backend = ["dep:ekrano", "dep:goldy", "scenes/ekrano_backend"]
+use_ekrano = [
+    "ekrano_backend",
+    "scenes/use_ekrano",
+    "ekrano/goldy-default",
+    "goldy/vulkan",
+    "goldy/dx12",
+    "goldy/metal",
+    "goldy/instrumentation",
+]
+# Windows + NVIDIA: GOLDY_BACKEND=cuda cargo run -p with_winit --no-default-features -F goldy-cuda ...
+goldy-cuda = [
+    "ekrano_backend",
+    "scenes/goldy-cuda",
+    "ekrano/goldy-cuda",
+    "goldy/cuda",
+    "goldy/dx12",
+    "goldy/instrumentation",
+]
+tracy = ["ekrano_backend", "ekrano/tracy", "goldy/tracy"]
 
 [dependencies]
 vello = { workspace = true, features = ["wgpu"], optional = true }

@@ -636,7 +636,7 @@ fn dump_backend_info(backend: &str) {
 
 /// # Panics
 /// Can panic.
-#[cfg(all(feature = "use_vello", not(feature = "use_ekrano")))]
+#[cfg(all(feature = "use_vello", not(feature = "ekrano_backend")))]
 pub fn main() -> Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
@@ -667,7 +667,7 @@ pub fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Timestamped shutdown tracing (`RUST_LOG=velato::shutdown=info`).
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 mod shutdown_trace {
     use instant::Instant;
     use std::sync::OnceLock;
@@ -710,13 +710,13 @@ mod shutdown_trace {
 /// thread owns the window; TID_RENDER owns the surface. Without this gate, `LoopExiting`
 /// / `Suspended` can destroy the HWND while a retained resubmit or present still holds
 /// the swapchain — WARP then AVs inside `d3d10warp.dll` on the goldy submit worker.
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 struct SurfaceLifetime {
     released: std::sync::Mutex<bool>,
     cv: std::sync::Condvar,
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 impl SurfaceLifetime {
     fn new_released() -> Self {
         Self {
@@ -743,7 +743,7 @@ impl SurfaceLifetime {
     }
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()>) -> Arc<Window> {
     use winit::dpi::LogicalSize;
     use winit::window::WindowBuilder;
@@ -757,7 +757,7 @@ fn create_ekrano_window(event_loop: &winit::event_loop::EventLoopWindowTarget<()
     )
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 enum RenderCmd {
     SurfaceCreated(goldy::SurfaceExchange),
     SurfaceDropped,
@@ -771,7 +771,7 @@ enum RenderCmd {
     Shutdown,
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 struct InputState {
     transform: Affine,
     scene_ix: i32,
@@ -783,7 +783,7 @@ struct InputState {
     start: Instant,
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn is_device_lost_error(err: &impl std::fmt::Display) -> bool {
     let s = err.to_string();
     s.contains("0x887A0005")
@@ -795,7 +795,7 @@ fn is_device_lost_error(err: &impl std::fmt::Display) -> bool {
         || s.contains("GPU device is lost")
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn apply_render_cmd(
     cmd: RenderCmd,
     surface_exchange: &mut Option<goldy::SurfaceExchange>,
@@ -873,7 +873,7 @@ fn apply_render_cmd(
 /// Block until goldy-submit has executed and the GPU has retired all work
 /// scheduled on this context. Required before destroying swapchain-backed
 /// resources that retained command lists may still reference.
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn drain_gpu_before_surface_drop(render_ctx: Option<&goldy::Context>) {
     let Some(ctx) = render_ctx else {
         return;
@@ -884,7 +884,7 @@ fn drain_gpu_before_surface_drop(render_ctx: Option<&goldy::Context>) {
     }
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn drain_commands(
     cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
     surface_exchange: &mut Option<goldy::SurfaceExchange>,
@@ -949,7 +949,7 @@ fn drain_commands(
     true
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn build_ekrano_scene(
     scene: &mut ekrano::Scene,
     fragment: &mut ekrano::Scene,
@@ -1010,12 +1010,12 @@ fn build_ekrano_scene(
     render_params
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn present_token(token: ekrano::PresentToken) -> Result<(), String> {
     token.present().map_err(|e| e.to_string())
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 enum Presenter {
     /// Synchronous present on the render thread. Retained for easy A/B testing;
     /// `Presenter::new` currently always builds [`Self::Threaded`].
@@ -1030,7 +1030,7 @@ enum Presenter {
     },
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 impl Presenter {
     fn new(device_lost: Arc<std::sync::atomic::AtomicBool>) -> Self {
         // Capacity 0 would be a rendezvous; 1 lets TID_RENDER stay one
@@ -1139,7 +1139,7 @@ impl Presenter {
 ///
 /// Returned by helpers that can fail in two distinct ways, letting the main
 /// render loop stay readable without inline `break`/`continue` branches.
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 enum RenderStep<T> {
     /// Step produced a value; processing continues normally.
     Ok(T),
@@ -1154,7 +1154,7 @@ enum RenderStep<T> {
 ///
 /// Returns `false` if the thread should exit entirely (channel disconnected or
 /// `Shutdown` command received).
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn block_until_surface(
     cmd_rx: &std::sync::mpsc::Receiver<RenderCmd>,
     surface_exchange: &mut Option<goldy::SurfaceExchange>,
@@ -1199,7 +1199,7 @@ fn block_until_surface(
 /// before `TID_PRESENT` reads it, producing "No image to present".
 ///
 /// Returns `false` if the render loop should exit.
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn sync_present_and_drain(
     present_in_flight: &mut bool,
     presenter: &Presenter,
@@ -1236,7 +1236,7 @@ fn sync_present_and_drain(
 ///
 /// Returns [`RenderStep::SkipFrame`] on a transient prepare error and
 /// [`RenderStep::Shutdown`] on device loss.
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn take_stash_or_rebuild(
     stash: Option<ekrano::PreparedFrame>,
     renderer: &mut ekrano::GoldyRenderer,
@@ -1286,7 +1286,7 @@ fn take_stash_or_rebuild(
 ///
 /// Returns [`RenderStep::SkipFrame`] on a transient error and
 /// [`RenderStep::Shutdown`] on device loss.
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn try_submit_to_swapchain(
     renderer: &mut ekrano::GoldyRenderer,
     prepared: ekrano::PreparedFrame,
@@ -1312,7 +1312,7 @@ fn try_submit_to_swapchain(
 ///
 /// The result is stashed and consumed at the top of the next iteration if the
 /// viewport dimensions haven't changed; otherwise it is discarded.
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn build_overlap_stash(
     renderer: &mut ekrano::GoldyRenderer,
     scene: &mut ekrano::Scene,
@@ -1344,7 +1344,7 @@ fn build_overlap_stash(
 // Render thread entry point
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn ekrano_render_thread(
     mut renderer: ekrano::GoldyRenderer,
     mut scenes: SceneSet,
@@ -1538,7 +1538,7 @@ fn ekrano_render_thread(
     shutdown_trace::phase("render_thread", "TID_RENDER exiting");
 }
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     use ekrano::GoldyRenderer;
     use goldy::{
@@ -1880,7 +1880,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
 
 /// # Panics
 /// Can panic.
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 pub fn main() -> Result<()> {
     eprintln!("=== EKRANO BACKEND ACTIVE (pid {}) ===", std::process::id());
     // Goldy logs its GPU diagnostics (timeouts, completion-handler errors,

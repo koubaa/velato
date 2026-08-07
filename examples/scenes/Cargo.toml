@@ -12,7 +12,9 @@ workspace = true
 [features]
 default = ["use_vello"]
 use_vello = ["dep:vello", "velato/vello"]
-use_ekrano = ["dep:ekrano", "velato/ekrano"]
+ekrano_backend = ["dep:ekrano", "velato/ekrano"]
+use_ekrano = ["ekrano_backend", "ekrano/goldy-default"]
+goldy-cuda = ["ekrano_backend", "ekrano/goldy-cuda"]
 
 [dependencies]
 vello = { workspace = true, optional = true }

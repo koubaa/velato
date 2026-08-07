@@ -40,9 +40,9 @@ pub use test_scenes::test_scenes;
 use kurbo::Vec2;
 use peniko::{Color, color};
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 use ekrano::Scene;
-#[cfg(all(feature = "use_vello", not(feature = "use_ekrano")))]
+#[cfg(all(feature = "use_vello", not(feature = "ekrano_backend")))]
 use vello::Scene;
 
 pub struct SceneParams<'a> {

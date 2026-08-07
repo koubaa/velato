@@ -87,8 +87,8 @@ clippy.wildcard_dependencies = "warn"
 [workspace.dependencies]
 # NOTE: Make sure to keep this in sync with the version badge in README.md
 vello = { version = "0.7.0", default-features = false }
-ekrano = { path = "../../ekrano/ekrano" }
-goldy = { path = "../../goldy" }
+ekrano = { path = "../../ekrano/ekrano", default-features = false }
+goldy = { path = "../../goldy", default-features = false }
 kurbo = { version = "0.13.0" }
 peniko = { version = "0.6.0" }
 
@@ -117,4 +117,6 @@ default = ["vello"]
 vello = ["dep:vello"]
 wgpu = ["vello", "vello/wgpu"]
 ekrano = ["dep:ekrano"]
+# Windows + NVIDIA: GOLDY_BACKEND=cuda cargo run -p with_winit --no-default-features -F goldy-cuda ...
+goldy-cuda = ["ekrano", "ekrano/goldy-cuda"]
 tracy = ["ekrano", "ekrano/tracy"]

@@ -79,6 +79,12 @@ With ekrano backend
 cargo run -p with_winit --release --no-default-features --features use_ekrano --bin with_winit_bin
 ```
 
+With ekrano on the CUDA backend (Windows + NVIDIA):
+
+```shell
+GOLDY_BACKEND=cuda cargo run -p with_winit --release --no-default-features --features goldy-cuda --bin with_winit_bin
+```
+
 You can also load an entire folder or individual files.
 
 ```shell

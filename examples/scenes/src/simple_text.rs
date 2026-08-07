@@ -1,14 +1,14 @@
 // Copyright 2022 the Velato Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-#[cfg(feature = "use_ekrano")]
+#[cfg(feature = "ekrano_backend")]
 use ekrano::{Glyph, Scene};
 use kurbo::Affine;
 use peniko::{Blob, Brush, BrushRef, FontData, StyleRef};
 use skrifa::MetadataProvider;
 use skrifa::raw::FontRef;
 use std::sync::Arc;
-#[cfg(all(feature = "use_vello", not(feature = "use_ekrano")))]
+#[cfg(all(feature = "use_vello", not(feature = "ekrano_backend")))]
 use vello::{Glyph, Scene};
 
 // This is very much a hack to get things working.
