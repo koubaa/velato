@@ -1503,11 +1503,12 @@ fn ekrano_render_thread(
 
         let new_time = Instant::now();
         let _tz = goldy::tracy_zone!("velato.record_stats");
+        let total_us = (new_time - frame_start_time).as_micros() as u64;
         stats
             .lock()
             .expect("stats mutex poisoned")
             .add_sample(stats::Sample {
-                frame_time_us: (new_time - frame_start_time).as_micros() as u64,
+                frame_time_us: total_us,
             });
         frame_start_time = new_time;
     }
