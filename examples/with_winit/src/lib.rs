@@ -784,6 +784,22 @@ struct InputState {
 }
 
 #[cfg(feature = "ekrano_backend")]
+const GPU_FAILURE_LOG_TARGET: &str = "velato::gpu";
+
+#[cfg(feature = "ekrano_backend")]
+fn report_gpu_failure(context: &'static str, err: &impl std::fmt::Display, detail: &str) {
+    if tracing::enabled!(target: GPU_FAILURE_LOG_TARGET, tracing::Level::WARN) {
+        tracing::warn!(
+            target: GPU_FAILURE_LOG_TARGET,
+            context,
+            error_display = %err,
+            error_detail = %detail,
+            "GPU operation failed"
+        );
+    }
+}
+
+#[cfg(feature = "ekrano_backend")]
 fn is_device_lost_error(err: &impl std::fmt::Display) -> bool {
     let s = err.to_string();
     s.contains("0x887A0005")
@@ -1296,7 +1312,7 @@ fn try_submit_to_swapchain(
     match renderer.submit_to_swapchain(prepared, surface) {
         Ok(result) => RenderStep::Ok(result),
         Err(e) => {
-            eprintln!("submit_to_swapchain error: {e}");
+            report_gpu_failure("submit_to_swapchain", &e, &e.detail());
             if is_device_lost_error(&e) {
                 device_lost.store(true, std::sync::atomic::Ordering::Relaxed);
                 RenderStep::Shutdown
@@ -1893,6 +1909,8 @@ pub fn main() -> Result<()> {
     // tracing and per-frame perf heartbeats are still reachable via
     // `RUST_LOG=goldy=info,ekrano=debug` or similar.
     // Shutdown stall diagnosis: `RUST_LOG=velato::shutdown=info`.
+    // GPU submit/present failures: `RUST_LOG=velato::gpu=warn` (enabled by default `warn` filter).
+    // Goldy submit-worker root cause: `RUST_LOG=goldy::submit=warn`.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt()
