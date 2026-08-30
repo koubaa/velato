@@ -79,10 +79,18 @@ With ekrano backend
 cargo run -p with_winit --release --no-default-features --features use_ekrano --bin with_winit_bin
 ```
 
-With ekrano on the CUDA backend (Windows + NVIDIA):
+With tracy as well:
 
 ```shell
-GOLDY_BACKEND=cuda cargo run -p with_winit --release --no-default-features --features goldy-cuda --bin with_winit_bin
+cargo run -p with_winit --release --no-default-features --features use_ekrano,tracy --bin with_winit_bin
+```
+
+With ekrano on the CUDA backend (Windows + NVIDIA):
+Select a Goldy backend at runtime (`GOLDY_BACKEND=dx12|vk|wgpu|cuda`; default is the platform native backend):
+
+```shell
+GOLDY_BACKEND=wgpu cargo run -p with_winit --release --no-default-features --features use_ekrano --bin with_winit_bin
+GOLDY_BACKEND=cuda cargo run -p with_winit --release --no-default-features --features use_ekrano --bin with_winit_bin
 ```
 
 You can also load an entire folder or individual files.
