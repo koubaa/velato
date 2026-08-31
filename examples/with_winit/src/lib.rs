@@ -83,6 +83,16 @@ fn default_threads() -> usize {
 }
 
 #[cfg(feature = "use_vello")]
+fn unwrap_surface_texture(current: wgpu::CurrentSurfaceTexture) -> wgpu::SurfaceTexture {
+    match current {
+        wgpu::CurrentSurfaceTexture::Success(texture) | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+            texture
+        }
+        other => panic!("failed to get surface texture: {other:?}"),
+    }
+}
+
+#[cfg(feature = "use_vello")]
 struct RenderState<'s> {
     // SAFETY: We MUST drop the surface before the `window`, so the fields
     // must be in this order
@@ -445,10 +455,9 @@ fn run(
                             )
                             .expect("failed to render to surface");
 
-                        let surface_texture = surface
-                            .surface
-                            .get_current_texture()
-                            .expect("failed to get surface texture");
+                        let surface_texture = unwrap_surface_texture(
+                            surface.surface.get_current_texture(),
+                        );
 
                         let mut encoder = device_handle.device.create_command_encoder(
                             &wgpu::CommandEncoderDescriptor {

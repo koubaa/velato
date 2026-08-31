@@ -86,11 +86,15 @@ clippy.wildcard_dependencies = "warn"
 
 [workspace.dependencies]
 # NOTE: Make sure to keep this in sync with the version badge in README.md
-vello = { version = "0.7.0", default-features = false }
+vello = { version = "0.10.0", default-features = false }
 ekrano = { path = "../../ekrano/ekrano", default-features = false }
 goldy = { path = "../../goldy", default-features = false }
-kurbo = { version = "0.13.0" }
-peniko = { version = "0.6.0" }
+kurbo = { version = "0.13.1" }
+peniko = { version = "0.6.1" }
+skrifa = { version = "0.44.0", default-features = false, features = ["autohint_shaping"] }
+bytemuck = { version = "1.25.0", features = ["derive"] }
+image = { version = "0.25.10", default-features = false }
+wgpu = { version = "29.0.3", default-features = false, features = ["std", "wgsl"] }
 
 [lints]
 workspace = true

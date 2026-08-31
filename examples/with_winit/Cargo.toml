@@ -44,7 +44,7 @@ ekrano = { workspace = true, optional = true }
 goldy = { workspace = true, optional = true }
 kurbo = { workspace = true }
 peniko = { workspace = true }
-wgpu = { version = "27.0", features = ["vulkan", "metal", "dx12"], optional = true }
+wgpu = { workspace = true, features = ["vulkan", "metal", "dx12"], optional = true }
 scenes = { path = "../scenes", default-features = false }
 anyhow = "1"
 clap = { version = "4.5.38", features = ["derive"] }

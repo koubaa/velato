@@ -6,9 +6,9 @@ use peniko::{Brush, Color, Fill};
 use scenes::RobotoText;
 use std::collections::VecDeque;
 
-#[cfg(feature = "use_vello")]
+#[cfg(all(feature = "use_vello", not(feature = "ekrano_backend")))]
 use vello::low_level::BumpAllocators;
-#[cfg(feature = "use_vello")]
+#[cfg(all(feature = "use_vello", not(feature = "ekrano_backend")))]
 use vello::{AaConfig, Scene};
 
 #[cfg(feature = "ekrano_backend")]
