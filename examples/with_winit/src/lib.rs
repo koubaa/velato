@@ -1568,7 +1568,7 @@ fn ekrano_render_thread(
 fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     use ekrano::GoldyRenderer;
     use goldy::{
-        DeviceDescriptor, Instance, PresentMode, RequestAdapterOptions, SurfaceConfig,
+        RuntimeDescriptor, Instance, PresentMode, RequestAdapterOptions, SurfaceConfig,
         SurfaceExchange,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1598,7 +1598,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
     let device = instance
         .request_adapter(&RequestAdapterOptions::default())
         .expect("No GPU adapter found")
-        .request_device(&DeviceDescriptor::default())
+        .request_runtime(&RuntimeDescriptor::default())
         .expect("No GPU device found");
     let start_create = Instant::now();
     let renderer = GoldyRenderer::new(&device).expect("Failed to create ekrano renderer");
@@ -1901,7 +1901,7 @@ fn run_ekrano(event_loop: EventLoop<()>, args: Args, scenes: SceneSet) {
         "[bench] fps={:.1} frame_ms={:.3} min_ms={:.3} max_ms={:.3}",
         snap.fps, snap.frame_time_ms, snap.frame_time_min_ms, snap.frame_time_max_ms
     );
-    shutdown_trace::phase("ui", "about to drop Device and Instance on main thread");
+    shutdown_trace::phase("ui", "about to drop Runtime and Instance on main thread");
 }
 
 /// # Panics
@@ -1938,7 +1938,7 @@ pub fn main() -> Result<()> {
     if let Some(scenes) = scenes {
         let event_loop = EventLoopBuilder::<()>::with_user_event().build()?;
         run_ekrano(event_loop, args, scenes);
-        shutdown_trace::phase("main", "run_ekrano returned (Device/Instance dropped)");
+        shutdown_trace::phase("main", "run_ekrano returned (Runtime/Instance dropped)");
     }
     Ok(())
 }
